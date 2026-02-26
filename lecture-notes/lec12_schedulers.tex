@@ -1,0 +1,529 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{booktabs}
+
+% Code listing style
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray}\itshape,
+    stringstyle=\color{red},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4
+}
+
+\title{\textbf{CS3210: Operating Systems} \\ Lecture 12 --- Schedulers}
+\author{John Kim \\ Georgia Institute of Technology}
+\date{February 24, 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Motivation: Why Do We Need Schedulers?}
+% ============================================================
+
+\subsection{The Core Problem: Multiplexing}
+
+A scheduler is needed any time there are \textbf{multiple resource consumers} competing for a \textbf{scarce set of shared resources}. This is the fundamental problem of \emph{multiplexing}.
+
+Consider:
+\begin{itemize}
+    \item With 1 process and 1 CPU --- no scheduling decisions needed.
+    \item With 2 processes and 2 CPUs --- still no contention, trivially satisfied.
+    \item With more processes than CPUs --- a scheduler is required to decide \emph{who runs when}.
+\end{itemize}
+
+Scheduling is deeply tied to \textbf{economic theory}: allocating scarce resources among competing consumers to maximize some measure of value.
+
+\subsection{What Does a Scheduler Do?}
+
+The scheduler is one of the key OS mechanisms enabling:
+\begin{itemize}
+    \item \textbf{Process isolation} --- ensuring processes don't interfere with each other.
+    \item \textbf{Resource multiplexing} --- sharing CPU time among processes, which implies:
+    \begin{itemize}
+        \item \emph{Fairness:} each process gets a reasonable share.
+        \item \emph{Resource utilization:} the CPU is not wasted sitting idle.
+    \end{itemize}
+\end{itemize}
+
+\subsection{What Can Be Scheduled?}
+
+The scheduling abstraction is broadly applicable. In different contexts, schedulers manage:
+\begin{itemize}
+    \item \textbf{Processes/threads} on CPUs (the classic OS case)
+    \item \textbf{Disk I/O requests}
+    \item \textbf{Network packets/connections}
+    \item \textbf{Cloud system resources} (VMs, containers)
+    \item \textbf{AI workloads} (GPU time for training vs. inference)
+\end{itemize}
+
+\subsection{The Goal of a Scheduler}
+
+\textbf{High-level goal:} Maximize the amount of work we care about.
+
+This sounds simple but is deceptively complex --- ``work we care about'' depends entirely on the workload and policy. This leads to a rich design space of scheduling algorithms.
+
+% ============================================================
+\section{Scheduling Goals}
+% ============================================================
+
+Different systems optimize for very different objectives. There is no universal best scheduler.
+
+\subsection{Throughput Scheduling}
+
+\textbf{Use case:} Disk I/O scheduling.
+
+\begin{itemize}
+    \item Performance varies by \emph{orders of magnitude} depending on access patterns (sequential vs. random I/O).
+    \item \textbf{Elevator scheduling} (SCAN): The disk head sweeps back and forth, servicing requests in order of disk position. Reduces total seek distance.
+    \begin{itemize}
+        \item \emph{Implicit assumption:} There is an \emph{actuation delay} when changing direction.
+        \item \textbf{Declarative scheduling} (e.g., Coda elevators): Instead of specifying \emph{how} to schedule, specify \emph{what outcome} is desired. The system figures out the optimal execution.
+    \end{itemize}
+\end{itemize}
+
+\subsection{Response Time Scheduling}
+
+\textbf{Use case:} Social media feeds, web servers, interactive applications.
+
+Minimize the time between a user action and the system's response. Even if throughput is lower, a snappy experience is preferred.
+
+\subsection{Latency SLO Attainment}
+
+\textbf{Use case:} Ad serving, LLM inter-token generation latency, AR/VR.
+
+Maximize the fraction of requests that complete within a predefined \textbf{Service Level Objective (SLO)} deadline. This is framed as an \textbf{optimization problem}.
+
+\subsection{Cost Minimization}
+
+\textbf{Use case:} Cloud computing.
+
+Minimize resource cost (e.g., dollars spent on CPU hours) while still meeting performance requirements.
+
+\subsection{The Systems Conjecture}
+
+A key insight in systems design: \textbf{you cannot simultaneously optimize for all three of:}
+
+\begin{center}
+\begin{tabular}{ccc}
+\toprule
+\textbf{Simplicity} & \textbf{Performance} & \textbf{Cost} \\
+\midrule
+Easy to implement & High throughput / low latency & Cheap to run \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Any real system must pick (at most) two. A simple algorithm is rarely the fastest; a high-performance algorithm is rarely cheap; cheap systems are rarely simple or fast.
+
+% ============================================================
+\section{Latency Distribution Functions}
+% ============================================================
+
+To reason about latency SLOs, we need tools to characterize latency distributions.
+
+\subsection{Probability Distribution Function (PDF)}
+
+$y = P(X = x)$: The probability that a request's latency is \emph{exactly} $x$ ms.
+
+\subsection{Cumulative Distribution Function (CDF)}
+
+$y = P(X \leq x)$: The probability that a request's latency is \emph{at most} $x$ ms.
+
+A CDF plot with latency on the x-axis and $P(X \leq x)$ on the y-axis shows what fraction of requests complete within each latency value.
+
+\subsection{Tail Latency}
+
+\textbf{Tail latency} refers to high-percentile latencies --- e.g., the 99th percentile (p99) latency is the value $x$ such that 99\% of requests complete within $x$ ms.
+
+\textbf{Example:} Suppose a CDF shows:
+\begin{itemize}
+    \item Median (p50) latency: 16.19 ms
+    \item p90 latency: 29.40 ms
+    \item p99 latency: 35.67 ms
+    \item Latency SLO: 36 ms
+\end{itemize}
+
+The scheduler's job (in SLO scheduling) is to ensure that the p99 (or whatever SLO target) stays within the deadline. Tail latency is what \emph{users notice} and what SLAs are written against.
+
+% ============================================================
+\section{Scheduler Design Space}
+% ============================================================
+
+\subsection{Scheduler Scenarios}
+
+Two contrasting workloads:
+\begin{itemize}
+    \item \textbf{Long-running jobs}: A simple FCFS (First Come, First Served) scheduler may be fine. Jobs run to completion without much switching overhead.
+    \item \textbf{Very short jobs}: A \textbf{preemptive} scheduler is better. Jobs are short enough that frequent switching is worthwhile to improve responsiveness.
+\end{itemize}
+
+\textbf{Why does a different scheduler excel for each?} Because the cost/benefit of preemption differs: for long jobs, context switching overhead is negligible relative to job length; for short jobs, responsiveness matters more than throughput.
+
+\subsubsection*{Advanced Scheduling Strategies}
+
+\begin{itemize}
+    \item \textbf{Delayed scheduling} (EuroSys'10): Intentionally delay scheduling to get better locality or packing. This is a \emph{non-work-preserving} strategy (CPU may be idle briefly while waiting for a better assignment).
+    \item \textbf{Power of two choices}: Randomly sample two queues and schedule on the less loaded one. Simple heuristic with strong theoretical guarantees.
+    \item \textbf{Spatio-temporal bin packing} (TetriSched, EuroSys'16): Pack jobs into resources in both space (which machines) and time (when) to maximize utilization, like fitting Tetris pieces.
+\end{itemize}
+
+\textbf{Key concept: \emph{Fluidity}} --- how fluidly can jobs be split across resources? Think of it like sand (very fine-grained, flows anywhere) vs.\ water (flows but has surface tension) vs.\ blocks (coarse, rigid). This is the idea of \emph{spatio-temporal granularity}: how small a unit of work can be moved, and over what time horizon.
+
+\subsection{Design Considerations: Costs and Benefits}
+
+When building a scheduler, weigh:
+
+\textbf{Costs of scheduling:}
+\begin{itemize}
+    \item \textbf{Context switching overhead:}
+    \begin{itemize}
+        \item \emph{Switching computation:} CPU time spent saving and restoring register state.
+        \item \emph{Caching costs:} After a context switch, the new process's data is likely not in cache (TLB and cache cold start). This can dominate for short time quanta.
+    \end{itemize}
+    \item \textbf{Scheduler time complexity:} A complex scheduler (e.g., one that computes optimal assignments) takes more CPU time itself.
+    \item \textbf{Predictability:} Real-time operating systems (RTOS) need deterministic scheduling latency. Complex algorithms introduce jitter.
+\end{itemize}
+
+\textbf{Benefits of scheduling:}
+\begin{itemize}
+    \item Better resource utilization (CPUs don't sit idle while runnable processes wait).
+    \item More CPU time directed to high-priority/high-value tasks.
+    \item Stronger Quality of Service (QoS) guarantees.
+\end{itemize}
+
+\subsection{The Full Scheduling Design Space}
+
+Designers must choose along many axes:
+
+\begin{itemize}
+    \item \textbf{Throughput vs. latency:} Optimize for total work done, or for individual request response time?
+    \item \textbf{Fairness:} Time quota (equal time slices), epoch-based fairness, weighted fairness in heterogeneous contexts.
+    \item \textbf{QoS / Priority:} Should some processes be more important? (Linux \texttt{nice} values, real-time priorities.)
+    \item \textbf{Preemptive vs. Cooperative:}
+    \begin{itemize}
+        \item \emph{Preemptive:} The OS can forcibly remove a process from the CPU (via timer interrupt).
+        \item \emph{Cooperative:} Processes voluntarily yield the CPU. Simpler, but a misbehaving process can starve everyone else.
+    \end{itemize}
+    \item \textbf{Global vs. Local:} Does the scheduler have a system-wide view (global), or does each CPU decide independently (local)? Global is more optimal but harder to scale.
+    \item \textbf{Scalability:} Can the scheduler handle 1M processes? $O(n)$ algorithms that scan a full process table don't scale.
+    \item \textbf{Granularity (time quantum):} 10ms? 100ms? Dynamic? Shorter quanta improve responsiveness but increase overhead.
+    \item \textbf{Constraints:} Real-time deadlines (e.g., flight control systems must meet hard deadlines).
+    \item \textbf{Other concerns:} Resource starvation, performance consolidation in cloud environments.
+\end{itemize}
+
+\subsection{Scheduling Is Difficult in Practice}
+
+\textbf{No perfect, universal scheduling policy exists.} Goals are contradictory:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Goal A} & \textbf{vs. Goal B} \\
+\midrule
+Maximize throughput & Minimize latency \\
+Minimize response time & Maximize scalability \\
+Maximize fairness & Maximize scalability \\
+Maximize resource utilization & Minimize power consumption \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This motivates many different algorithms: FCFS, Shortest Job First (SJF), Priority Scheduling, Round-Robin (RR), Multi-level Queue, Multi-level Feedback Queue (MLFQ), MinJCT, and more.
+
+% ============================================================
+\section{Scheduling Algorithms}
+% ============================================================
+
+\subsection{Round Robin (RR)}
+
+Round-Robin is the algorithm used in xv6. Each process is assigned a fixed time unit (\emph{quantum} or \emph{time slice}), and processes are served in circular order.
+
+\textbf{Advantages:}
+\begin{itemize}
+    \item \textbf{Simple:} Fixed time unit per process, no priority computations.
+    \item \textbf{Starvation-free:} Since there is no priority, every process is eventually served.
+\end{itemize}
+
+\textbf{Disadvantages:}
+\begin{itemize}
+    \item Does not distinguish urgency or priority between processes.
+    \item \textbf{Deadline-unaware:} Cannot meet real-time deadlines.
+    \item Does not handle the disparity between throughput-oriented and latency-sensitive workloads.
+\end{itemize}
+
+\textbf{Example (Quantum = 3):} With processes P1(0,1), P2(0,2), ..., P10(11,1), each process gets 3 time units before being preempted. Short processes finish quickly; long processes have high turnaround time but no starvation.
+
+\subsection{Linux Completely Fair Scheduler (CFS)}
+
+\subsubsection*{Motivating Observation}
+
+Processes that \emph{constantly consume the full CPU} are likely lower priority than those that mostly sleep and wake up for short bursts.
+
+\textbf{Example:} A network server (e.g., nginx) needs low latency to handle incoming requests, but spends most of its time sleeping waiting for connections. A deep learning training job, by contrast, runs continuously. The network server should be rewarded for sleeping and given high priority when it wakes.
+
+\textbf{Key Idea:} \emph{Reduce the priority of processes that always consume full CPU.} Conversely, boost priority of processes that frequently sleep.
+
+\subsubsection*{Weighted Fair Queuing (WFQ)}
+
+CFS is Linux's implementation of \textbf{Weighted Fair Queuing (WFQ)}:
+\begin{itemize}
+    \item Resources are shared \emph{proportionally} to each process's \textbf{weight}.
+    \item Example: If process A has weight 2 and process B has weight 1, then A gets 2/3 of the CPU and B gets 1/3.
+    \item Weights in Linux correspond to \texttt{nice} values (range $-20$ to $+19$; lower = higher priority).
+\end{itemize}
+
+\subsubsection*{CFS and Sleeping Processes}
+
+What happens when a process sleeps and misses its CPU time? Naively, when it wakes up, it has a massive backlog of ``owed'' CPU time and could monopolize the CPU.
+
+CFS handles this with \textbf{virtual runtime} (\texttt{vruntime}): each process tracks how much CPU time it has consumed (normalized by weight). CFS always runs the process with the \emph{smallest} \texttt{vruntime}. When a process wakes from sleep, its \texttt{vruntime} is set to the \emph{current minimum}, so it gets priority without a runaway effect.
+
+\textbf{Graphical intuition (from lecture):} The priority of a sleeping inference server oscillates up and down (it gets high priority when it wakes, then drops as it consumes CPU). The DL training job continuously decays in priority since it always consumes full CPU.
+
+\subsection{Scheduling Policies in Linux}
+
+Linux supports multiple scheduling policies, selectable per-process:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Policy} & \textbf{Description} \\
+\midrule
+\texttt{SCHED\_OTHER} & Normal time-sharing (default); uses CFS. \\
+\texttt{SCHED\_IDLE}  & Very low priority background tasks. \\
+\texttt{SCHED\_BATCH} & CPU-intensive batch processes; longer time slices. \\
+\texttt{SCHED\_FIFO}  & Real-time, first-in first-out; runs until it blocks. \\
+\texttt{SCHED\_RR}    & Real-time round-robin with fixed time quantum. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{SCHED\_FIFO} and \texttt{SCHED\_RR} are real-time policies and preempt all \texttt{SCHED\_OTHER} processes.
+
+\subsection{Real-Time Scheduling}
+
+Real-time systems are divided into two categories:
+
+\begin{itemize}
+    \item \textbf{Hard real-time:} Critical tasks \emph{must} complete within a guaranteed time bound. Missing a deadline is a system failure (e.g., airbag deployment, flight control).
+    \begin{itemize}
+        \item \emph{Note:} Hard real-time is \emph{impractical} with secondary storage (disk) or virtual memory. Why? Because page faults and disk I/O have unpredictable, potentially unbounded latency that can make deadlines impossible to guarantee.
+    \end{itemize}
+    \item \textbf{Soft real-time:} Critical processes receive priority over less critical ones, but occasional deadline misses are tolerable (e.g., video streaming, interactive audio).
+\end{itemize}
+
+\textbf{Soft real-time requires two things:}
+\begin{enumerate}
+    \item \textbf{Priority scheduling} (urgency-aware): The system must know which processes are time-critical and prefer them.
+    \item \textbf{Low dispatch latency:} After a high-priority process becomes runnable, it must actually run quickly. This is hard to guarantee because:
+    \begin{itemize}
+        \item System calls may not be preemptible (e.g., the kernel cannot safely interrupt a system call mid-execution without complex locking).
+        \item Linux achieves low dispatch latency via the ``fully preemptible kernel'' configuration.
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Characterizing Processes}
+
+Not all processes are the same. Key distinctions:
+
+\begin{itemize}
+    \item \textbf{CPU-bound:} Spends most of its time computing (e.g., scientific simulation, video encoding).
+    \item \textbf{I/O-bound:} Spends most of its time waiting for I/O (e.g., database, file server).
+    \item \textbf{Interactive processes:} Respond to user input (e.g., vim, emacs). Require low latency.
+    \item \textbf{Batch processes:} Run without user interaction on a schedule (e.g., cron jobs). Throughput matters more than latency.
+    \item \textbf{Real-time processes:} Have strict timing requirements (e.g., audio playback, video streaming, AR/VR, chatbot).
+    \begin{itemize}
+        \item Present an interesting \emph{throughput vs. latency tradeoff}: the system cares about both queries-per-second (qps) and per-request real-time success metrics like Token Budget Time (TBT) for LLM inference.
+    \end{itemize}
+\end{itemize}
+
+% ============================================================
+\section{Context Switching in xv6}
+% ============================================================
+
+\subsection{The xv6 Scheduler}
+
+xv6 uses a simple \textbf{round-robin} scheduler. Its main loop:
+
+\begin{lstlisting}[language=C, caption={xv6 scheduler (proc.c)}]
+// Loop over process table looking for process to run.
+acquire(&ptable.lock);
+for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state != RUNNABLE)
+        continue;
+
+    // Switch to chosen process. It is the process's job
+    // to release ptable.lock and then reacquire it
+    // before jumping back to us.
+    proc = p;
+    switchuvm(p);
+    p->state = RUNNING;
+    swtch(&cpu->scheduler, p->context);
+    switchkvm();
+
+    // Process is done running for now.
+    // It should have changed its p->state before coming back.
+    proc = 0;
+}
+release(&ptable.lock);
+\end{lstlisting}
+
+\textbf{Steps:}
+\begin{enumerate}
+    \item Scan the process table for a \texttt{RUNNABLE} process.
+    \item Set the current per-CPU process pointer (\texttt{proc = p}).
+    \item Call \texttt{switchuvm(p)} to switch to the process's page table.
+    \item Mark the process as \texttt{RUNNING}.
+    \item Call \texttt{swtch} to perform the kernel context switch.
+    \item After the process yields, call \texttt{switchkvm()} to switch back to kernel page table.
+    \item Reset \texttt{proc = 0} and continue scanning.
+\end{enumerate}
+
+\subsection{Context Switching: Big Picture}
+
+\textbf{What we want to do:} Switch directly from process A (e.g., \texttt{shell}) to process B (e.g., \texttt{cat}) by swapping their kernel contexts.
+
+\textbf{What we actually have to do:} There is no direct user-to-user context switch. The full path is always:
+
+\[
+\text{shell (user)} \xrightarrow{\text{save user ctx}} \text{shell (kernel)} \xrightarrow{\text{swtch}} \text{scheduler} \xrightarrow{\text{swtch}} \text{cat (kernel)} \xrightarrow{\text{restore user ctx}} \text{cat (user)}
+\]
+
+This means \textbf{two} calls to \texttt{swtch}:
+\begin{enumerate}
+    \item Process's kernel context $\to$ CPU scheduler context (via \texttt{sched}/\texttt{yield}).
+    \item CPU scheduler context $\to$ next process's kernel context (via \texttt{scheduler}).
+\end{enumerate}
+
+\textbf{Key rule:} xv6 \emph{never} directly switches from user-space to user-space.
+
+\subsection{Context Switching: Implementation Challenges}
+
+\begin{itemize}
+    \item \textbf{How to switch from one process to another?} $\to$ Context switching (save/restore registers + stack).
+    \item \textbf{How to make context switching transparent?} $\to$ Timer interrupts force preemption without process cooperation.
+    \item \textbf{How to switch among processes running concurrently?} $\to$ Locking (specifically \texttt{ptable.lock}) prevents races on the process table.
+    \item \textbf{How to coordinate processes?} $\to$ Sleeping on events (e.g., a process sleeps waiting for a pipe to have data, or for a child to exit).
+\end{itemize}
+
+\subsection{Two Kinds of Context Switch}
+
+\begin{enumerate}
+    \item \textbf{Process kernel context $\to$ CPU scheduler context:} When the running process gives up the CPU (via \texttt{yield}, \texttt{sleep}, or \texttt{exit}).
+    \item \textbf{CPU scheduler context $\to$ process kernel context:} When the scheduler picks the next process to run.
+\end{enumerate}
+
+\subsection{xv6 Process Kernel Context}
+
+\begin{itemize}
+    \item Every xv6 process has its own \textbf{kernel context}: a kernel stack and a register set (including \texttt{\%esp} and \texttt{\%eip}).
+    \item Every CPU has its own \textbf{scheduler thread} (with its own kernel stack).
+    \item Switching threads = saving current registers + loading next registers, including \texttt{\%esp} (stack pointer) and \texttt{\%eip} (instruction pointer).
+\end{itemize}
+
+\subsection{The \texttt{swtch} Function}
+
+\begin{lstlisting}[language=C]
+void swtch(struct context**, struct context*);
+\end{lstlisting}
+
+\texttt{swtch} is a low-level assembly routine that:
+\begin{itemize}
+    \item \textbf{Does not know about threads} --- it purely saves and loads register sets called \emph{contexts}.
+    \item When a kernel thread gives up the CPU, it calls \texttt{swtch} to save itself and return to the scheduler context.
+    \item A \texttt{struct context*} is stored on the kernel stack.
+    \item Pushes current registers onto the old kernel stack; saves \texttt{\%esp} to \texttt{*old}.
+    \item Copies new context pointer into \texttt{\%esp}; pops previous registers; \texttt{ret} resumes at the saved \texttt{\%eip}.
+\end{itemize}
+
+\textbf{Detailed steps of \texttt{swtch}:}
+\begin{enumerate}
+    \item Load arguments off the stack into \texttt{\%eax} (old) and \texttt{\%edx} (new) \emph{before} modifying \texttt{\%esp}.
+    \item Save only \textbf{callee-saved registers}: \texttt{\%ebp}, \texttt{\%ebx}, \texttt{\%esi}, \texttt{\%edi}. Push them; save \texttt{\%esp} as \texttt{*old}.
+    \item Note: \texttt{\%eip} was already saved by the \texttt{call} instruction (return address), positioned just before \texttt{\%ebp} on the stack.
+    \item Switch stacks: \texttt{movl \%edx, \%esp}.
+    \item Restore new context: pop \texttt{\%edi}, \texttt{\%esi}, \texttt{\%ebx}, \texttt{\%ebp}; then \texttt{ret} (which pops the saved \texttt{\%eip}).
+\end{enumerate}
+
+\textbf{Why only callee-saved registers?} Because \texttt{swtch} is a \emph{voluntary} yield --- the kernel thread calls \texttt{swtch} explicitly as a function call. By the C calling convention, caller-saved registers are the caller's responsibility; they were saved by the code before calling \texttt{swtch}. Only callee-saved registers need to be preserved across the call boundary.
+
+\subsection{yield}
+
+\texttt{yield} is called at the end of each timer interrupt to preempt the current process.
+
+The call chain is:
+\[
+\texttt{yield} \to \texttt{sched} \to \texttt{swtch}
+\]
+
+\texttt{yield} switches from \texttt{proc->context} to \texttt{cpu->scheduler}.
+
+\subsection{Giving Up the CPU: Protocol}
+
+Any process giving up the CPU (via \texttt{yield}, \texttt{sleep}, or \texttt{exit}) must follow these steps:
+
+\begin{enumerate}
+    \item \textbf{Acquire \texttt{ptable.lock}:} Protects process state.
+    \item \textbf{Release any other locks:} To avoid holding locks across a context switch, which could cause deadlocks.
+    \item \textbf{Update its own state:} Set to \texttt{RUNNABLE} (yield) or \texttt{SLEEPING} (sleep) or \texttt{ZOMBIE} (exit).
+    \item \textbf{Call \texttt{sched}:} Which calls \texttt{swtch} to hand off to the scheduler.
+\end{enumerate}
+
+\texttt{yield}, \texttt{sleep}, and \texttt{exit} all follow this same pattern.
+
+\subsection{sched and scheduler: Coroutines}
+
+\begin{itemize}
+    \item A kernel thread always gives up in \texttt{sched} and switches to the \emph{same location} in the scheduler (wherever the scheduler last called \texttt{swtch}).
+    \item The scheduler almost always switches to a process in \texttt{sched}.
+    \item This back-and-forth forms a pattern of \textbf{coroutines}: two execution contexts that cooperatively pass control back and forth at well-defined handoff points.
+    \item \textbf{Exception:} \texttt{forkret} --- when a newly created process runs for the first time, there is no saved \texttt{sched} context to return to. Instead, the process starts at \texttt{forkret}, which performs initialization and then returns to user space.
+\end{itemize}
+
+% ============================================================
+\section{Summary}
+% ============================================================
+
+\begin{itemize}
+    \item \textbf{Schedulers} are needed for resource multiplexing when demand exceeds supply.
+    \item Scheduling goals vary: throughput, latency, SLO attainment, fairness, cost --- and these goals conflict.
+    \item The \textbf{Systems Conjecture}: you cannot have simplicity, performance, and low cost simultaneously.
+    \item \textbf{CFS} (Linux) implements Weighted Fair Queuing, dynamically adjusting priorities based on CPU consumption.
+    \item \textbf{Real-time scheduling} comes in hard (guaranteed deadlines) and soft (best-effort priority) flavors.
+    \item Linux exposes multiple scheduling policies (\texttt{SCHED\_OTHER}, \texttt{SCHED\_FIFO}, \texttt{SCHED\_RR}, etc.) to support different workload types.
+    \item In \textbf{xv6}: context switching always goes through the kernel scheduler (never user $\to$ user directly). \texttt{swtch} saves and restores callee-saved registers. \texttt{sched}/\texttt{scheduler} operate as coroutines.
+\end{itemize}
+
+% ============================================================
+\section{References}
+% ============================================================
+
+\begin{itemize}
+    \item Arpaci-Dusseau, R. H.; Arpaci-Dusseau, A. C. (2014). ``Multi-level Feedback Queue.'' \textit{Operating Systems: Three Easy Pieces}. Arpaci-Dusseau Books.
+    \item Silberschatz, A.; Galvin, P. B.; Gagne, G. (1999). \textit{Applied Operating System Concepts}. John Wiley \& Sons.
+    \item Lozi, J.-P. et al. ``The Linux Scheduler: a Decade of Wasted Cores.'' EuroSys 2016.
+    \item IBM DeveloperWorks. ``The Completely Fair Scheduler.'' \url{https://www.ibm.com/developerworks/linux/library/l-completely-fair-scheduler/}
+\end{itemize}
+
+% ============================================================
+\section*{Personal Notes}
+% ============================================================
+% Add your own notes below this line
+
+\end{document}
