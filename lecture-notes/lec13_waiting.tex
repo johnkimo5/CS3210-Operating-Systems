@@ -1,0 +1,469 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+
+% Code listing style
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray}\itshape,
+    stringstyle=\color{red},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4
+}
+
+\title{\textbf{CS3210: Operating Systems} \\ Lecture 13 --- Waiting}
+\author{Francisco Romero \\ Georgia Institute of Technology}
+\date{Spring 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Scheduling Wrapup}
+% ============================================================
+
+\subsection{Scheduling Algorithms Recap}
+
+There are many different ways to schedule processes. No single algorithm is a silver bullet (i.e., no one-size-fits-all solution), but some algorithms may be better suited than others for a given workload or scenario.
+
+\subsection{xv6 Scheduler}
+
+The xv6 scheduler follows a simple round-robin approach over the process table. Its steps are:
+
+\begin{enumerate}
+    \item Loop over the process table looking for \texttt{RUNNABLE} processes.
+    \item Upon finding one, set the current per-CPU process to \texttt{proc} (the current CPU on which the scheduler is running).
+    \item Switch the page table with \texttt{switchuvm}, mark the process as \texttt{RUNNING}, and call \texttt{swtch}.
+\end{enumerate}
+
+\begin{lstlisting}[language=C, caption={xv6 scheduler loop (proc.c)}]
+// Loop over process table looking for process to run.
+acquire(&ptable.lock);
+for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state != RUNNABLE)
+        continue;
+
+    // Switch to chosen process. It is the process's job
+    // to release ptable.lock and then reacquire it
+    // before jumping back to us.
+    c->proc = p;
+    switchuvm(p);
+    p->state = RUNNING;
+
+    swtch(&(c->scheduler), p->context);
+    switchkvm();
+
+    // Process is done running for now.
+    // It should have changed its p->state before coming back.
+    c->proc = 0;
+}
+release(&ptable.lock);
+\end{lstlisting}
+
+\subsection{Research Perspective}
+
+Scheduling is a very hard, very active area of systems research. Two notable research projects from SOSP'21:
+
+\begin{itemize}
+    \item \textbf{ghOSt:} Provides an abstraction and interface for userspace software to define complex scheduling policies, from the per-CPU model to a system-wide (centralized) model. Importantly, ghOSt decouples the kernel scheduling \emph{mechanism} from \emph{policy} definition.
+
+    \item \textbf{Syrup:} Allows application developers to write a scheduling policy as a set of matching functions between inputs (threads, network packets, network connections) and executors (cores, network sockets, NIC queues), then deploy it across system layers without modifying application code.
+\end{itemize}
+
+% ============================================================
+\section{Waiting}
+% ============================================================
+
+\subsection{Motivation: Locks and Mutual Exclusion}
+
+Recall that locks enforce \textbf{Mut}ual \textbf{Ex}clusion (mutex). When thread \texttt{t1} holds a lock, thread \texttt{t2} must wait until \texttt{t1} releases it before acquiring the lock itself. This serializes access to a critical section.
+
+However, mutual exclusion alone is not sufficient for all synchronization problems. Sometimes a thread needs to \emph{wait} for a specific \emph{condition} to become true, not just for a lock to become available.
+
+\subsection{Data Races}
+
+\textbf{Definition:} A \emph{data race} occurs when there are two unordered accesses to the same memory location, at least one of which is a write.
+
+\begin{itemize}
+    \item Locks are needed to avoid data races.
+    \item Think about what ``unordered'' means in this context.
+    \item Locks add \emph{ordering} --- the acquire/release pair creates a happens-before relationship between operations in different threads.
+\end{itemize}
+
+\subsubsection*{Race Condition Example: Concurrent List Insert}
+
+Consider the following linked list and insert function:
+
+\begin{lstlisting}[language=C, caption={Concurrent list insert (without locks)}]
+struct list {
+    int data;
+    struct list *next;
+};
+
+struct list *list = 0;
+
+void insert(int data) {
+    struct list *l;
+    l = malloc(sizeof *l);
+    l->data = data;
+    l->next = list;   // <-- race here
+    list = l;         // <-- and here
+}
+\end{lstlisting}
+
+If two threads (\texttt{t1}, \texttt{t2}) call \texttt{insert} concurrently, the following interleaving is possible:
+\begin{enumerate}
+    \item \texttt{t1} reads \texttt{list} into \texttt{l1->next}.
+    \item \texttt{t2} reads \texttt{list} into \texttt{l2->next} and sets \texttt{list = l2}.
+    \item \texttt{t1} sets \texttt{list = l1}, overwriting \texttt{t2}'s node.
+\end{enumerate}
+Result: \texttt{l2} is \emph{lost} from the list.
+
+\subsubsection*{Fix: Use a Lock}
+
+Wrapping the critical section with a lock serializes the insert operations:
+
+\begin{lstlisting}[language=C, caption={Concurrent list insert (with lock)}]
+void insert(int data) {
+    struct list *l;
+    l = malloc(sizeof *l);
+    l->data = data;
+    acquire(&lock);   // enter critical section
+    l->next = list;
+    list = l;
+    release(&lock);   // leave critical section
+}
+\end{lstlisting}
+
+\subsection{Producer/Consumer Problem}
+
+Consider a producer-consumer queue:
+
+\begin{itemize}
+    \item \textbf{Producer:} Adds elements to the queue.
+    \item \textbf{Consumer:} Removes elements from the queue; if the queue is empty, it must \emph{wait} for the next element.
+\end{itemize}
+
+\textbf{Real-world use cases:} Web server request handling, AI inference serving, video streaming, etc.
+
+\textbf{Goals:}
+\begin{itemize}
+    \item A computationally efficient waiting primitive.
+    \item An ordering primitive: production must happen-before consumption ($P \to C$).
+\end{itemize}
+
+We need some way to \textbf{wait} efficiently.
+
+\subsection{Waiting with Ordering: Condition Variables}
+
+Our main waiting primitive is a \textbf{Condition Variable (CV)}, which allows a process to wait on a \emph{condition}.
+
+\textbf{Traditional CV interface:}
+\begin{itemize}
+    \item \texttt{wait(lock *lk);} --- Atomically releases the lock and sleeps until notified. May have \emph{spurious wakeups}.
+    \item \texttt{signal();} --- Wakes up \emph{one} waiter.
+    \item \texttt{broadcast();} --- Wakes up \emph{all} waiters.
+\end{itemize}
+
+\subsection{Can We Just Use a Lock?}
+
+\begin{lstlisting}[language=C, caption={Attempt 1: Lock only (BROKEN)}]
+produce(int v) {              int consume() {
+    lock(lk);                     lock(lk);
+    q.push(v);                    v = q.pop();   // crashes if empty!
+    unlock(lk);                   unlock(lk);
+}                                 return v;
+                              }
+\end{lstlisting}
+
+\textbf{Problem:} If the queue is empty and the consumer calls \texttt{q.pop()}, this is undefined behavior.
+
+\begin{lstlisting}[language=C, caption={Attempt 2: Lock with empty check (still BROKEN)}]
+int consume() {
+    lock(lk);
+    if (!q.empty())
+        v = q.pop();
+    unlock(lk);
+    return v;
+}
+\end{lstlisting}
+
+\textbf{Problem:} Consumer does nothing useful when the queue is empty --- it returns without data. It never \emph{waits}.
+
+\subsection{Can We Use a Lock + CV?}
+
+\begin{lstlisting}[language=C, caption={Attempt 3: Lock + CV with \texttt{if} (BROKEN)}]
+produce(int v) {              int consume() {
+    lock(lk);                     lock(lk);
+    q.push(v);                    if (q.empty()) {
+    unlock(lk);                       cv.wait(lk);
+}                                 }
+                                  v = q.pop();
+                                  unlock(lk);
+                                  return v;
+                              }
+\end{lstlisting}
+
+\textbf{Problem (2 consumers, 1 producer):} Consider P1, C1, and C2 all waiting.
+\begin{enumerate}
+    \item P1 pushes, calls \texttt{cv.signal()}, unlocks.
+    \item C1 wakes up from \texttt{cv.wait()}, but before it pops, C2 also evaluates \texttt{if (q.empty())} and sees a non-empty queue.
+    \item C2 skips the \texttt{if} and calls \texttt{q.pop()}, draining the queue.
+    \item C1 then calls \texttt{q.pop()} on an empty queue --- crash!
+\end{enumerate}
+The \texttt{if} check does not re-verify the condition after waking up.
+
+\begin{lstlisting}[language=C, caption={Attempt 4: Lock + CV + \texttt{while} (CORRECT)}]
+produce(int v) {              int consume() {
+    lock(lk);                     lock(lk);
+    q.push(v);                    while (q.empty()) {
+    cv.signal();                      cv.wait(lk);
+    unlock(lk);                   }
+}                                 v = q.pop();
+                                  unlock(lk);
+                                  return v;
+                              }
+\end{lstlisting}
+
+Now this works as intended.
+
+\subsection{Waiting Takeaways}
+
+\begin{itemize}
+    \item \textbf{Always wrap \texttt{wait()} in a \texttt{while} loop.}
+    \item \textbf{Reason:} Race conditions! Another thread may consume the resource between the wakeup and the pop.
+    \item The loop ensures the condition is \emph{re-checked} before proceeding.
+    \item \textbf{Side note:} C++11's \texttt{std::condition\_variable::wait()} with a predicate does this automatically: it is equivalent to \texttt{while (!pred()) wait(lock);}.
+\end{itemize}
+
+\subsection{Where Should We Place \texttt{signal()}?}
+
+There are three positions for \texttt{cv.signal()} in the producer:
+
+\begin{enumerate}
+    \item \textbf{Before \texttt{unlock}} (inside the lock): Safe. Signal is sent while the lock is held.
+    \item \textbf{After \texttt{unlock}} (outside the lock): Also correct. The woken consumer must re-acquire the lock anyway.
+    \item \textbf{Before \texttt{lock}} (outside, before acquiring): Incorrect --- the push hasn't happened yet.
+\end{enumerate}
+
+The key requirement is that \texttt{q.push} \emph{happens-before} the consumer's \texttt{q.pop} (ordering guarantee: $P \to C$). Both options 1 and 2 satisfy this.
+
+% ============================================================
+\section{CPU Behavior During Waiting}
+% ============================================================
+
+\subsection{What Happens to the CPU When a Process Waits?}
+
+When a process waits for another, two options exist for the CPU:
+\begin{itemize}
+    \item \textbf{Switch:} The CPU switches to running another process (efficient use of CPU).
+    \item \textbf{Sleep:} The CPU itself sleeps (used in low-power scenarios).
+\end{itemize}
+
+\subsection{What Needs to Be Saved When a Process Sleeps?}
+
+When a process goes to sleep (blocks waiting), the OS must save sufficient state to resume it later. The state to save includes:
+
+\begin{itemize}
+    \item \textbf{User address space} --- saved in the process's page table (no extra work needed at sleep time).
+    \item \textbf{User context (registers)} --- saved on the call to the kernel (trap frame).
+    \item \textbf{Kernel address space} --- managed by the kernel already.
+    \item \textbf{Kernel context (registers)} --- \emph{needs to be saved explicitly!} This is done by the \texttt{swtch} function.
+\end{itemize}
+
+% ============================================================
+\section{Context Switching in xv6}
+% ============================================================
+
+\subsection{Big Picture}
+
+Conceptually, we want to switch directly from one process (e.g., \texttt{shell}) to another (e.g., \texttt{cat}). In practice, this requires two kernel context switches:
+
+\begin{enumerate}
+    \item From the current process's kernel context $\to$ CPU scheduler context.
+    \item From the scheduler context $\to$ the new process's kernel context.
+\end{enumerate}
+
+\textbf{Key rule:} xv6 \emph{never} directly switches from user-space to user-space. The full path is:
+\[
+\text{user-kernel transition} \to \text{context switch to scheduler} \to \text{context switch to new process's kernel thread} \to \text{trap return}
+\]
+
+\subsection{xv6 Process Kernel Context}
+
+\begin{itemize}
+    \item Every xv6 process has its own \textbf{kernel context}, consisting of a kernel stack and register set (including \texttt{\%esp}, \texttt{\%eip}).
+    \item Every CPU has its own \textbf{scheduler thread}.
+    \item Switching from one thread to another involves saving and loading CPU registers, including \texttt{\%esp} and \texttt{\%eip}.
+\end{itemize}
+
+\subsection{The \texttt{swtch} Function}
+
+\begin{lstlisting}[language=C, caption={swtch signature}]
+void swtch(struct context**, struct context*);
+\end{lstlisting}
+
+\texttt{swtch} is a low-level assembly routine (in \texttt{swtch.S}) that:
+\begin{itemize}
+    \item Does \emph{not} know about threads --- it simply saves and loads sets of registers called \emph{contexts}.
+    \item When a kernel thread is ready to give up the CPU, it calls \texttt{swtch} to save its own context and return to the scheduler context.
+    \item A \texttt{context} is a \texttt{struct context*} stored on the kernel stack.
+\end{itemize}
+
+\textbf{Steps of \texttt{swtch}:}
+\begin{enumerate}
+    \item Load arguments off the stack into \texttt{\%eax} and \texttt{\%edx} \emph{before} changing \texttt{\%esp}.
+    \item Save callee-saved registers only: \texttt{\%ebp}, \texttt{\%ebx}, \texttt{\%esi}, \texttt{\%edi}. Push first four; save \texttt{\%esp} as \texttt{*old}.
+    \item \texttt{\%eip} was implicitly saved by the \texttt{call} instruction (just before \texttt{\%ebp}).
+    \item Move the pointer to the new context into \texttt{\%esp} (stack switch).
+    \item Pop the new callee-saved registers in reverse order; \texttt{ret} resumes execution at the new \texttt{\%eip}.
+\end{enumerate}
+
+\begin{lstlisting}[language={[x86masm]Assembler}, caption={swtch.S}]
+.globl swtch
+swtch:
+    movl 4(%esp), %eax      # old context**
+    movl 8(%esp), %edx      # new context*
+
+    # Save old callee-saved registers
+    pushl %ebp
+    pushl %ebx
+    pushl %esi
+    pushl %edi
+
+    # Switch stacks
+    movl %esp, (%eax)       # save old %esp in *old
+    movl %edx, %esp         # load new %esp
+
+    # Load new callee-saved registers
+    popl %edi
+    popl %esi
+    popl %ebx
+    popl %ebp
+    ret
+\end{lstlisting}
+
+\subsection{Why Only Callee-Saved Registers?}
+
+\begin{itemize}
+    \item \texttt{swtch} represents a \emph{voluntary} preemption mechanism --- the kernel thread \emph{chooses} to call \texttt{swtch}.
+    \item By the calling convention, caller-saved registers are already saved by the caller before the call. Only callee-saved registers need to be preserved across function calls.
+    \item In contrast, the \textbf{trap handler} must save \emph{all} registers (caller + callee) because it is \emph{involuntary} --- it can interrupt a thread at any point in time, when no calling convention assumptions can be made.
+\end{itemize}
+
+\subsection{\texttt{yield}: Giving Up the CPU Voluntarily}
+
+At the end of each timer interrupt, the trap handler can call \texttt{yield}. The call chain is: \texttt{yield} $\to$ \texttt{sched} $\to$ \texttt{swtch}.
+
+\begin{lstlisting}[language=C, caption={yield() in proc.c}]
+// Give up the CPU for one scheduling round.
+void yield(void) {
+    acquire(&ptable.lock);  // DOC: yieldlock
+    myproc()->state = RUNNABLE;
+    sched();
+    release(&ptable.lock);
+}
+\end{lstlisting}
+
+\subsection{Giving Up the CPU: General Protocol}
+
+When any process gives up the CPU (via \texttt{yield}, \texttt{sleep}, or \texttt{exit}), it must:
+
+\begin{enumerate}
+    \item Acquire \texttt{ptable.lock}.
+    \item Release any other locks (carefully, to avoid deadlocks).
+    \item Update its own state (e.g., \texttt{RUNNABLE} or \texttt{SLEEPING}).
+    \item Call \texttt{sched()}.
+\end{enumerate}
+
+\texttt{sched()} performs sanity checks and then calls \texttt{swtch(\&p->context, mycpu()->scheduler)} to switch to the scheduler.
+
+\begin{lstlisting}[language=C, caption={sched() in proc.c}]
+void sched(void) {
+    int intena;
+    struct proc *p = myproc();
+
+    if(!holding(&ptable.lock))  panic("sched ptable.lock");
+    if(mycpu()->ncli != 1)      panic("sched locks");
+    if(p->state == RUNNING)     panic("sched running");
+    if(readeflags()&FL_IF)      panic("sched interruptible");
+
+    intena = mycpu()->intena;
+    swtch(&p->context, mycpu()->scheduler);
+    mycpu()->intena = intena;
+}
+\end{lstlisting}
+
+\subsection{Overview of Process Sleeping}
+
+The full path for a context switch (e.g., from \texttt{shell} to \texttt{cat}):
+
+\begin{enumerate}
+    \item Trap (syscall or timer interrupt) saves user context onto the kernel stack.
+    \item Kernel code calls \texttt{swtch} (save kernel context of \texttt{shell}, load scheduler kernel context).
+    \item Scheduler finds next runnable process (\texttt{cat}).
+    \item Scheduler calls \texttt{swtch} again (save scheduler context, load kernel context of \texttt{cat}).
+    \item Trap return restores user context of \texttt{cat} and jumps back to user space.
+\end{enumerate}
+
+\subsection{Where Does a Process Go When It Waits?}
+
+Sleeping processes are tracked using a \textbf{wait list}:
+\begin{itemize}
+    \item Once a process sleeps, it is placed on the wait list.
+    \item Processes can be woken up from the wait list when the condition they are waiting on is satisfied.
+\end{itemize}
+
+\subsection{Waiting in xv6}
+
+xv6 uses a single list for \emph{all} waiting processes. Processes sleep on \textbf{channels} (the \texttt{chan} variable): any pointer value can serve as a channel, acting as a key to identify \emph{which} condition a process is sleeping on.
+
+\begin{lstlisting}[language=C, caption={sleep() and wakeup1() in proc.c}]
+// Atomically release lock and sleep on chan.
+// Reacquires lock when awakened.
+void sleep(void *chan, struct spinlock *lk) {
+    // ...
+}
+
+// Wake up all processes sleeping on chan.
+// The ptable lock must be held.
+static void wakeup1(void *chan) {
+    struct proc *p;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+        if(p->state == SLEEPING && p->chan == chan)
+            p->state = RUNNABLE;
+}
+\end{lstlisting}
+
+% ============================================================
+\section{Summary}
+% ============================================================
+
+\begin{itemize}
+    \item \textbf{Locks} provide mutual exclusion but not ordering.
+    \item \textbf{Condition Variables (CVs)} enable efficient waiting on conditions. Always use a \texttt{while} loop around \texttt{wait()}.
+    \item \textbf{Context switching} in xv6 always goes through the kernel: user $\to$ kernel $\to$ scheduler $\to$ kernel $\to$ user.
+    \item \textbf{\texttt{swtch}} saves and restores callee-saved registers (voluntary preemption), whereas the trap handler saves all registers (involuntary).
+    \item \textbf{Sleeping processes} are placed on a wait list; xv6 uses channels as identifiers for which condition a process is waiting on.
+    \item \textbf{\texttt{yield}}, \textbf{\texttt{sleep}}, and \textbf{\texttt{exit}} all go through \texttt{sched()} $\to$ \texttt{swtch()}.
+\end{itemize}
+
+% ============================================================
+\section*{Personal Notes}
+% ============================================================
+% Add your own notes below this line
+
+\end{document}
