@@ -1,0 +1,675 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{booktabs}
+\usepackage{mdframed}
+\usepackage{parskip}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+
+% ── Colours ───────────────────────────────────────────────────────────────────
+\definecolor{keycolor}{RGB}{0,100,180}
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{codecomment}{RGB}{80,130,80}
+\definecolor{codestring}{RGB}{180,50,50}
+\definecolor{boxbg}{RGB}{240,248,255}
+\definecolor{warnbg}{RGB}{255,248,230}
+\definecolor{warnborder}{RGB}{200,140,0}
+
+% ── Code listings ─────────────────────────────────────────────────────────────
+\lstset{
+  language=C,
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{keycolor}\bfseries,
+  commentstyle=\color{codecomment}\itshape,
+  stringstyle=\color{codestring},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  breaklines=true,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!50},
+  xleftmargin=2em,
+  tabsize=4,
+  showstringspaces=false,
+}
+
+% ── Callout boxes ─────────────────────────────────────────────────────────────
+\newmdenv[
+  backgroundcolor=boxbg,
+  linecolor=keycolor,
+  linewidth=1.5pt,
+  leftline=true, rightline=false, topline=false, bottomline=false,
+  innerleftmargin=10pt, innerrightmargin=8pt,
+  skipabove=6pt, skipbelow=6pt,
+]{keybox}
+
+\newmdenv[
+  backgroundcolor=warnbg,
+  linecolor=warnborder,
+  linewidth=1.5pt,
+  leftline=true, rightline=false, topline=false, bottomline=false,
+  innerleftmargin=10pt, innerrightmargin=8pt,
+  skipabove=6pt, skipbelow=6pt,
+]{warnbox}
+
+% ── Section formatting ────────────────────────────────────────────────────────
+\titleformat{\section}{\large\bfseries\color{keycolor}}{}{0em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+\titleformat{\subsubsection}{\normalsize\itshape\bfseries}{}{0em}{}
+
+% ── Header / footer ──────────────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small CS~3210 -- Operating Systems}
+\rhead{\small Lectures 10 \& 11: Interrupts and Concurrency}
+\cfoot{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ── Macros ────────────────────────────────────────────────────────────────────
+\newcommand{\term}[1]{\textbf{#1}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\xv}{xv6}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries CS~3210 -- Operating Systems}\\[4pt]
+  {\large Lectures 10 \& 11: Interrupts, Exceptions, and Concurrency}\\[4pt]
+  {\normalsize Alexey Tumanov \quad|\quad Georgia Tech SCS
+    \quad|\quad Feb 17 \& 19, 2026}
+\end{center}
+
+\tableofcontents
+\newpage
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Virtual Memory: Swapping and the Clock Algorithm}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Memory Backing}
+
+Physical RAM is \emph{not} the hard ceiling on usable memory.  Two mechanisms
+extend the address space beyond physical RAM:
+
+\begin{itemize}
+  \item \term{Swapping} -- pages are evicted from RAM and saved to disk when
+    memory is exhausted; transparently reloaded on access.
+  \item \term{Memory-Mapped Files} -- file data is mapped directly into virtual
+    addresses and written back to disk on modification, avoiding an explicit
+    copy step.
+\end{itemize}
+
+\subsection{Page Eviction Policy}
+
+When RAM is full, the OS must choose a victim page to evict.
+
+\begin{center}
+\begin{tabular}{lll}
+  \toprule
+  \textbf{Policy} & \textbf{Idea} & \textbf{Feasibility} \\
+  \midrule
+  Optimal (Bélády) & Evict the page used furthest in the future & Impossible (requires future knowledge) \\
+  LRU              & Evict the least recently used page          & Theoretically ideal, practically costly \\
+  Clock (LRU approx.) & Approximate LRU with a single access bit & Practical \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Why Pure LRU Is Expensive}
+
+Exact LRU needs a timestamp on \emph{every} memory access (reads \emph{and}
+writes).  The overheads are prohibitive:
+\begin{itemize}
+  \item Maintaining a sorted data structure costs
+        $\mathcal{O}(n) \to \mathcal{O}(\log n) \to \mathcal{O}(1)$ depending
+        on implementation, but \emph{all} require work on each access.
+  \item The only practical hardware hook is a \term{page fault on every access},
+        i.e.\ marking the PTE as not-present (\code{PTE\_P = 0}) and trapping
+        to the OS -- this overhead is unacceptable even with infinite RAM.
+\end{itemize}
+
+\subsection{The Clock Algorithm (CAC)}
+
+The clock algorithm approximates LRU using one \term{access bit}~\(a\) per
+page, arranged in a circular list with a ``clock hand''.
+
+\begin{keybox}
+\textbf{Clock Algorithm Steps}
+\begin{enumerate}[leftmargin=*]
+  \item Hardware sets \(a = 1\) whenever a page is read or written.
+  \item On eviction pressure, the clock hand scans pages in order:
+    \begin{itemize}
+      \item If \(a = 1\): clear to \(a = 0\) (``give a second chance'') and
+            advance.
+      \item If \(a = 0\): \textbf{evict} this page.
+    \end{itemize}
+  \item After eviction, advance the hand past the evicted page.
+\end{enumerate}
+\end{keybox}
+
+\subsubsection{Trapping on Access}
+
+The OS only needs to know when a page transitions from \emph{unaccessed} to
+\emph{accessed}, not on every subsequent read.  The trick:
+
+\begin{itemize}
+  \item When the clock clears a page's access bit (\(a \leftarrow 0\)), it
+        also clears \code{PTE\_P = 0}.
+  \item The \emph{first} subsequent access faults, the fault handler sets
+        \(a = 1\) and \code{PTE\_P = 1}, then resumes -- no further traps until
+        the next clock sweep.
+\end{itemize}
+
+This means traps occur at most once per clock sweep per page, not on every
+access.
+
+\subsubsection{Worst-Case Analysis}
+
+Worst case: all pages have \(a = 1\) when eviction is needed.  The clock hand
+must do a full pass clearing all bits before it can evict -- $\mathcal{O}(n)$
+in the number of pages.  In practice this is rare and the algorithm performs
+well.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{System Calls, Interrupts, and Exceptions}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Why Interrupts?}
+
+Without interrupts, the only alternative is \term{polling}: the CPU repeatedly
+checks whether an event has occurred.
+
+\begin{itemize}
+  \item \textbf{Infrequent events} (e.g.\ keyboard): polling wastes nearly all
+        CPU cycles.
+  \item \textbf{Frequent events}: polling may still miss events and couples
+        event frequency to the polling rate.
+\end{itemize}
+
+Interrupts decouple the CPU from I/O timing entirely, improving both
+\textbf{performance} and \textbf{correctness}.
+
+\subsection{Interrupt Categories}
+
+\begin{center}
+\begin{tabular}{lll}
+  \toprule
+  \textbf{Category} & \textbf{Source} & \textbf{Examples} \\
+  \midrule
+  Exceptions       & CPU itself           & Page fault (vec.~14), divide-by-zero, memory errors \\
+  Hardware (INTR)  & External devices     & Timer (vec.~32), keyboard, NIC, disk \\
+  Software (INT)   & \code{INT n} instruction & System calls (\xv: \code{INT 0x40}) \\
+  Debugging        & Breakpoints          & Software breakpoints \\
+  NMI              & Critical hardware    & Power failure, memory corruption \\
+  IPI              & Other processors     & Inter-processor interrupt \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Maskable vs.\ Non-Maskable Interrupts}
+
+\begin{itemize}
+  \item \term{INTR (Maskable)}: Ignored when the \code{IF} flag in \code{EFLAGS}
+    is 0.  Controlled with:
+    \begin{itemize}
+      \item \code{sti} -- set interrupt flag (enable)
+      \item \code{cli} -- clear interrupt flag (disable)
+    \end{itemize}
+  \item \term{NMI (Non-Maskable Interrupt)}: Always delivered; used for
+    catastrophic events (power failure, memory corruption).  In \xv, an NMI
+    causes an immediate kernel panic.  x86 assigns NMI to vector~2.
+\end{itemize}
+
+\subsection{Programmable Interrupt Controller (PIC 8259A)}
+
+The x86 CPU has a limited number of physical interrupt pins.  The
+\term{Programmable Interrupt Controller (8259A)} fans out many device lines
+to a single CPU \code{INTR} pin, assigning each device a configurable vector
+number.
+
+\subsection{Interrupt Vectors and the IDT}
+
+\begin{keybox}
+Every interrupt/exception type is assigned an 8-bit \term{vector number}
+(0--255).  When an interrupt fires, the vector indexes into the
+\term{Interrupt Descriptor Table (IDT)} to find the handler address.
+\end{keybox}
+
+\subsubsection{Interrupt Descriptor Table (IDT)}
+
+\begin{itemize}
+  \item 256 entries $\times$ 8 bytes = 2\,KB table (analogous to the GDT).
+  \item Each entry is a \term{gate descriptor}: segment selector + handler
+    offset + privilege level (\code{DPL}).
+  \item The CPU register \term{IDTR} holds the physical address and size of
+    the current IDT; loaded with the \code{lidt} instruction.
+  \item In \xv, the IDT is populated at boot in \code{trap.c} using the
+    \code{SETGATE} macro.  Vectors jump to stubs in \code{vector.S}, which
+    then jump to \code{alltraps} in \code{trapasm.S}.
+\end{itemize}
+
+\subsubsection{Notable Vector Assignments in xv6}
+
+\begin{itemize}
+  \item Vector 14 $\to$ page-fault handler (Lab~2)
+  \item Vector 32 $\to$ timer/clock handler $\to$ scheduler (Lab~3)
+  \item Vector 0x40 $\to$ system call handler
+\end{itemize}
+
+\subsection{Software Interrupts and System Calls}
+
+The \code{INT n} instruction lets user-space intentionally invoke any handler:
+
+\begin{lstlisting}[language={[x86masm]Assembler},numbers=none]
+INT 0x40    ; invoke system call handler (xv6)
+\end{lstlisting}
+
+To return from an interrupt handler, use \code{iret}, which atomically
+restores \code{CS}, \code{EIP}, and \code{EFLAGS} from the kernel stack.
+
+\subsection{The \texttt{INT} Instruction: Step-by-Step}
+
+When \code{INT 0x40} executes:
+\begin{enumerate}
+  \item Determine the vector number (0x40 here).
+  \item Fetch the 8-byte IDT entry for vector 0x40 (base address from IDTR
+        $+$ 0x40 $\times$ 8).
+  \item Check \code{CPL $\leq$ DPL} in the descriptor (for software INT only).
+  \item If the target has a lower privilege level than the current CPL, save
+        \code{ESP}/\code{SS} to a CPU-internal register and reload them from
+        the \term{Task State Segment (TSS)} -- this is the kernel stack switch.
+  \item Push: user \code{SS}, user \code{ESP}, user \code{EFLAGS}, user
+        \code{CS}, user \code{EIP}.
+  \item Clear interrupt-enable and other \code{EFLAGS} bits.
+  \item Load \code{CS}:\code{EIP} from the IDT descriptor -- now executing
+        kernel handler code.
+\end{enumerate}
+
+\subsection{Interrupt Handling: High-Level View}
+
+\begin{enumerate}
+  \item \textbf{Identify} the interrupt (vector number).
+  \item \textbf{Privilege check} -- is the CPL allowed to invoke this vector?
+  \item \textbf{Stack switch} -- from user stack to dedicated kernel/handler
+        stack.
+  \item \textbf{Save registers} -- the \term{trap frame} captures all
+        user-space registers.
+  \item \textbf{Dispatch} -- jump to the appropriate kernel handler
+        (\code{trap.c} in \xv).
+  \item \textbf{Return} via \code{iret}, restoring saved state.
+\end{enumerate}
+
+In \xv:
+\begin{itemize}
+  \item \code{x86.h} defines the \code{trapframe} struct (registers pushed by
+    hardware + software).
+  \item \code{usys.S} defines system call stubs (issues \code{INT 0x40}).
+  \item \code{trapasm.S} defines \code{alltraps} (saves registers, calls C
+    handler) and \code{trapret} (restores and \code{iret}s).
+  \item \code{trap.c} contains the C-level \code{trap()} dispatcher -- most
+    of the code you will modify in labs.
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Concurrency I: Interrupts as Pseudo-Concurrency}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{warnbox}
+\textbf{Key Insight.} Interrupts create \emph{pseudo-concurrency}: an
+interrupt handler can preempt kernel code at any instruction boundary, just
+like a second thread.  Any shared data accessed by both kernel code and an
+interrupt handler is a potential race condition.
+\end{warnbox}
+
+\subsection{The Lock + Interrupt Deadlock Problem}
+
+Consider kernel code holding a spinlock when an interrupt fires, and the
+interrupt handler also tries to acquire the same lock:
+
+\begin{lstlisting}
+// Kernel code              // Interrupt handler
+Lock();                     Lock();       // DEADLOCK: already held!
+  x = shared;                Shared = 7;
+Unlock();                   Unlock();
+\end{lstlisting}
+
+The handler spins forever waiting for a lock held by the code it interrupted.
+
+\subsection{Solution: Disable Interrupts Around Locks}
+
+The safe pattern -- used in \xv:
+
+\begin{lstlisting}
+// Kernel code
+Interrupt_disable();   // cli
+  Acquire(lock);
+    x = shared;
+    Shared = 7;
+  Release(lock);
+Interrupt_enable();    // sti
+\end{lstlisting}
+
+\begin{keybox}
+\textbf{\xv Rule:} Interrupts are disabled (via \code{pushcli}) whenever a
+spinlock is acquired.  Mutual exclusion with interrupt handlers is achieved
+through interrupt disabling, \emph{not} by having the handler skip locks.
+\end{keybox}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Concurrency II: Mutual Exclusion and Locking}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{The ``Too Much Milk'' Problem}
+
+A classic thought experiment for mutual exclusion with shared memory:
+
+\textbf{Scenario:} Alice and Bob share a fridge.  Each independently checks
+if milk is present; if not, they go buy some.
+
+\begin{itemize}
+  \item \term{Shared variable}: presence of milk (boolean).
+  \item \term{Safety}: at most one person buys milk.
+  \item \term{Liveness}: if milk is needed, \emph{someone} buys it.
+\end{itemize}
+
+\textbf{The race:}
+\begin{enumerate}
+  \item Bob checks fridge $\to$ no milk.
+  \item Alice checks fridge $\to$ no milk (before Bob returns).
+  \item Both go buy milk $\to$ too much milk!
+\end{enumerate}
+
+The problem generalises to any \textbf{check-then-act} pattern on shared
+state.
+
+\subsection{Formalising the Problem}
+
+\begin{itemize}
+  \item ``Check fridge'' $\equiv$ \emph{read} a shared variable.
+  \item ``Put milk in fridge'' $\equiv$ \emph{update} a shared variable.
+  \item Bugs occur only for \emph{some} execution interleavings, making them
+    hard to reproduce.
+  \item Correct solutions must be safe for \emph{all} possible interleavings.
+\end{itemize}
+
+\subsection{Peterson's Algorithm (Theoretical Only)}
+
+Peterson's algorithm achieves mutual exclusion between two threads using only
+atomic stores and loads (flag variables + a \emph{turn} variable).
+
+\begin{warnbox}
+\textbf{Completely Impractical in Practice.}  Peterson's algorithm does not
+scale beyond two threads, does not account for hardware/compiler reordering,
+and has $\mathcal{O}(n)$ complexity variants for $n$ threads.  Mentioned here
+for historical context only.  In real systems, hardware atomic primitives are
+required.
+\end{warnbox}
+
+\subsection{C11 Atomic Primitives}
+
+C11 (\code{<stdatomic.h>}) provides atomic operations with defined memory
+ordering semantics:
+
+\begin{center}
+\begin{tabular}{ll}
+  \toprule
+  \textbf{Operation} & \textbf{Description} \\
+  \midrule
+  \code{atomic\_load()}            & Atomic read \\
+  \code{atomic\_store()}           & Atomic write \\
+  \code{atomic\_fetch\_add()}      & Atomic read-modify-write (add) \\
+  \code{atomic\_exchange()}        & Atomic load + store in one op \\
+  \code{atomic\_compare\_exchange()} & Conditional atomic load+store (CAS) \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Building a Spinlock with \texttt{atomic\_exchange}}
+
+\begin{lstlisting}
+// lock == 0: free;  lock == 1: held
+int r = 1;
+while (r != 0) {
+    r = atomic_exchange(&lock, 1);  // atomically set lock=1, return old value
+}
+// critical section
+atomic_store(&lock, 0);             // release
+\end{lstlisting}
+
+\begin{itemize}
+  \item If \code{lock} was 0, \code{exchange} returns 0, loop exits --
+        \textbf{lock acquired}.
+  \item If \code{lock} was 1, \code{exchange} returns 1, loop continues --
+        \textbf{spinning}.
+  \item This is a \term{spinlock}: the thread busy-waits consuming CPU cycles.
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Memory Models and Data Races}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{The Sequential Consistency Assumption Is Wrong}
+
+Programmers naturally assume each statement executes in order and is
+immediately visible to all cores.  This is called \term{sequential
+consistency (SC)}, but neither x86 nor C/C++ guarantee it by default.
+
+\subsection{x86 Total Store Order (TSO)}
+
+x86 uses the \term{Total Store Order (TSO)} memory model:
+
+\begin{itemize}
+  \item \textbf{Write--Write (W$\to$W)} ordering: respected -- stores appear
+    globally in program order.
+  \item \textbf{Read--Write (R$\to$W)} ordering: respected.
+  \item \textbf{Write--Read (W$\to$R)} ordering: \emph{not} guaranteed --
+    a store may not be visible before a subsequent load in the same thread.
+\end{itemize}
+
+\textbf{Concrete example:}
+
+\begin{lstlisting}
+// Initial: x = y = 0
+// Thread T1              // Thread T2
+movl $1, (x)             movl $1, (y)
+movl (y), %eax           movl (x), %ebx
+\end{lstlisting}
+
+Under TSO, both \code{\%eax = 0} and \code{\%ebx = 0} is \emph{possible}
+(both threads can observe stale values due to store-buffer reordering), even
+though it appears impossible under sequential consistency.
+
+\subsection{C11 DRF0 Semantics}
+
+C/C++11 offers \term{DRF0} (Data-Race-Free 0) semantics:
+
+\begin{keybox}
+\textbf{DRF0 Guarantee:} If your program has \emph{no data races}, then it
+behaves as if sequentially consistent.  If it \emph{does} have data races,
+behaviour is \textbf{undefined}.
+\end{keybox}
+
+\textbf{Definition of a data race:} two or more concurrent accesses to the
+same memory location, where at least one is a \emph{write}, with no
+synchronisation between them.
+
+\subsection{Practical Takeaway}
+
+Write \term{data-race-free (DRF)} code:
+\begin{itemize}
+  \item Use locks, semaphores, condition variables, or barriers whenever
+    shared data is accessed.
+  \item Use C11 atomic primitives only in rare, well-understood cases
+    (they have complicated semantics).
+  \item When in doubt, \emph{overlock} (accept a performance hit) rather than
+    \emph{underlock} (introduce subtle correctness bugs).
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Deadlock and the Dining Philosophers}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Deadlock}
+
+\term{Deadlock} occurs when a set of threads each hold a lock and wait for a
+lock held by another -- a circular dependency with no progress.
+
+A realistic \xv example: \code{ideintr} holds the IDE lock, then calls
+\code{wakeup()}, which tries to acquire \code{ptable.lock}.  If another thread
+holds \code{ptable.lock} and waits for the IDE lock, deadlock results.
+
+\subsection{Dining Philosophers}
+
+Five philosophers sit at a round table, each needing two forks (shared with
+neighbours) to eat.  If all simultaneously pick up their \emph{left} fork and
+wait for the right one, everyone starves -- \textbf{deadlock}.
+
+\textbf{Solution -- Impose a Global Lock Ordering:}
+
+\begin{keybox}
+Assign each resource (fork) a global number.  \emph{Always} acquire locks in
+\textbf{increasing numeric order}.  This breaks circular wait: if the last
+philosopher acquires the lower-numbered fork first, the cycle is broken.
+\end{keybox}
+
+\xv uses at most two locks simultaneously (e.g.\ directory lock + file lock
+in the filesystem) and enforces a consistent acquisition order.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{The \texttt{volatile} Keyword}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{warnbox}
+\textbf{\texttt{volatile} is widely misunderstood.}  It does \emph{not}:
+\begin{itemize}
+  \item Provide atomicity.
+  \item Enforce memory ordering or fencing.
+  \item Make a variable safe to share between threads.
+\end{itemize}
+
+\texttt{volatile} only tells the compiler that the variable may change
+outside the current thread's execution -- preventing certain compiler
+optimisations (e.g.\ caching in a register).
+
+Its \emph{only} legitimate use in systems code is for \textbf{memory-mapped
+device registers} -- not for thread synchronisation.  Use C11 atomic
+primitives or proper locks instead.
+
+\textit{Further reading:} \url{https://www.kernel.org/doc/html/latest/process/volatile-considered-harmful.html}
+\end{warnbox}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Spinlocks in xv6}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{The \texttt{spinlock} Struct}
+
+\begin{lstlisting}
+struct spinlock {
+    atomic_uint locked;   // 0 = free, 1 = held
+    // Debugging fields:
+    char       *name;     // Lock name
+    struct cpu *cpu;      // CPU holding the lock
+    uint        pcs[10];  // Call stack (program counters) at acquisition
+};
+\end{lstlisting}
+
+\subsection{\texttt{acquire()}}
+
+\begin{lstlisting}
+void acquire(struct spinlock *lk) {
+    pushcli();   // Disable interrupts to prevent interrupt deadlock
+
+    if (holding(lk))
+        panic("acquire");  // Re-entrant acquisition would deadlock
+
+    // Spin until the lock is free, then atomically grab it.
+    // memory_order_acq_rel also acts as a memory fence:
+    //   reads after acquire() are not reordered before it.
+    while (atomic_exchange_explicit(&lk->locked, 1,
+                                    memory_order_acq_rel) != 0)
+        ;   // spin
+
+    // Record debug info
+    lk->cpu = cpu;
+    getcallerpcs(&lk, lk->pcs);
+}
+\end{lstlisting}
+
+\textbf{Key points:}
+\begin{itemize}
+  \item \code{pushcli()} increments a per-CPU interrupt-disable counter;
+    \code{popcli()} decrements it and re-enables interrupts only when the
+    counter reaches zero (supports nested acquire/release).
+  \item \code{memory\_order\_acq\_rel} on the exchange is a \term{memory
+    barrier}: ensures no memory operations from inside the critical section
+    migrate before the acquire.
+  \item Panics on re-entrant acquisition -- \xv spinlocks are non-recursive.
+\end{itemize}
+
+\subsection{\texttt{release()}}
+
+\begin{lstlisting}
+void release(struct spinlock *lk) {
+    if (!holding(lk))
+        panic("release");
+
+    lk->pcs[0] = 0;
+    lk->cpu = 0;
+
+    // Release the lock with a release fence: ensures all writes inside the
+    // critical section are visible before the lock is freed.
+    atomic_store_explicit(&lk->locked, 0, memory_order_release);
+
+    popcli();  // Re-enable interrupts (if outermost acquire)
+}
+\end{lstlisting}
+
+\textbf{Key points:}
+\begin{itemize}
+  \item \code{memory\_order\_release} ensures critical-section writes are
+    visible to the next thread that acquires the lock.
+  \item \code{popcli()} after the store: interrupts must stay disabled until
+    \emph{after} the lock is dropped to maintain the invariant.
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Summary and Big Picture}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\begin{center}
+\begin{tabular}{ll}
+  \toprule
+  \textbf{Concept} & \textbf{One-Line Summary} \\
+  \midrule
+  Clock Algorithm        & Approximate LRU using a circular access-bit list \\
+  Interrupts             & Asynchronous events handled via the IDT \\
+  IDT / Vectors          & 256-entry table mapping event numbers to handlers \\
+  INT instruction        & Software interrupt; used for syscalls in \xv \\
+  Trap Frame             & Saved register state pushed on interrupt entry \\
+  Interrupt Deadlock     & Handler + kernel code competing for the same lock \\
+  pushcli / popcli       & Disable interrupts while holding a spinlock in \xv \\
+  Too Much Milk          & Motivates atomic check-and-set primitives \\
+  Peterson's Algorithm   & 2-thread software mutex -- impractical \\
+  atomic\_exchange       & Hardware primitive for building spinlocks \\
+  TSO Memory Model       & x86 allows W$\to$R reordering \\
+  DRF0                   & No data race $\Rightarrow$ sequential consistency \\
+  Dining Philosophers    & Deadlock; solution: global lock ordering \\
+  volatile               & Compiler hint only; not a sync primitive \\
+  xv6 spinlock           & atomic\_exchange + interrupt disable + debug info \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
