@@ -277,13 +277,13 @@ Processes that \emph{constantly consume the full CPU} are likely lower priority 
 
 \textbf{Example:} A network server (e.g., nginx) needs low latency to handle incoming requests, but spends most of its time sleeping waiting for connections. A deep learning training job, by contrast, runs continuously. The network server should be rewarded for sleeping and given high priority when it wakes.
 
-\textbf{Key Idea:} \emph{Reduce the priority of processes that always consume full CPU.} Conversely, boost priority of processes that frequently sleep.
+\textbf{Key Idea:} \emph{Reduce the priority of processes that always consume full CPU.} Conversely, boost priority of processes that frequently sleep. We're incentivizing processes to not constantly need the CPU.
 
 \subsubsection*{Weighted Fair Queuing (WFQ)}
 
 CFS is Linux's implementation of \textbf{Weighted Fair Queuing (WFQ)}:
 \begin{itemize}
-    \item Resources are shared \emph{proportionally} to each process's \textbf{weight}.
+    \item Resources (temporal, spatial) are shared \emph{proportionally} to each process's \textbf{weight}.
     \item Example: If process A has weight 2 and process B has weight 1, then A gets 2/3 of the CPU and B gets 1/3.
     \item Weights in Linux correspond to \texttt{nice} values (range $-20$ to $+19$; lower = higher priority).
 \end{itemize}
@@ -325,7 +325,7 @@ Real-time systems are divided into two categories:
     \begin{itemize}
         \item \emph{Note:} Hard real-time is \emph{impractical} with secondary storage (disk) or virtual memory. Why? Because page faults and disk I/O have unpredictable, potentially unbounded latency that can make deadlines impossible to guarantee.
     \end{itemize}
-    \item \textbf{Soft real-time:} Critical processes receive priority over less critical ones, but occasional deadline misses are tolerable (e.g., video streaming, interactive audio).
+    \item \textbf{Soft real-time:} Critical processes receive priority over less critical ones, but occasional deadline misses are tolerable (e.g., video streaming, interactive audio). The optimization function setup is different here.
 \end{itemize}
 
 \textbf{Soft real-time requires two things:}
