@@ -22,7 +22,7 @@
 }
 
 \title{\textbf{CS3210: Operating Systems} \\ Lecture 13 --- Waiting}
-\author{Francisco Romero \\ Georgia Institute of Technology}
+\author{John Kim \\ Georgia Institute of Technology}
 \date{Spring 2026}
 
 \begin{document}
@@ -102,6 +102,17 @@ However, mutual exclusion alone is not sufficient for all synchronization proble
     \item Think about what ``unordered'' means in this context.
     \item Locks add \emph{ordering} --- the acquire/release pair creates a happens-before relationship between operations in different threads.
 \end{itemize}
+
+\subsection{Weak Ordering}
+
+\textbf{Definition:} Hardware can reorder reads and writes as long as the result is correct from \textbf{the executing thread's perspective}. Weak ordering does not concern itself with guaranteeing correctness across executing threads.
+
+\begin{itemize}
+    \item We've limited the set of possibilities
+    \item Acquire --- all subsequent reads/writes in the current thread happen after
+    \item Release --- All preceding reads/writes in the current thread happen before
+\end{itemize}
+
 
 \subsubsection*{Race Condition Example: Concurrent List Insert}
 
@@ -189,7 +200,9 @@ produce(int v) {              int consume() {
                               }
 \end{lstlisting}
 
-\textbf{Problem:} If the queue is empty and the consumer calls \texttt{q.pop()}, this is undefined behavior.
+\textbf{Problem:} If the queue is empty and the consumer calls \texttt{q.pop()}, this is undefined behavior. 
+
+\textbf{Template: } Safety, liveness, efficiency to answer these questions.
 
 \begin{lstlisting}[language=C, caption={Attempt 2: Lock with empty check (still BROKEN)}]
 int consume() {
