@@ -1,0 +1,237 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{booktabs}
+
+% Code listing style
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray}\itshape,
+    stringstyle=\color{red},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4
+}
+
+\title{\textbf{CS3210: Operating Systems} \\ Lecture 10 --- Interrupts and Concurrency (Part 1)}
+\author{John Kim \\ Georgia Institute of Technology}
+\date{February 17, 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Swapping Wrap-Up: Page Eviction Policies}
+% ============================================================
+
+\subsection{The Problem of Choosing Pages to Evict}
+
+\textbf{Swapping} is the OS mechanism for saving memory pages to disk when physical RAM is exhausted, then reloading them on demand. The central challenge is selecting \emph{which} pages to evict. The \textbf{ideal} candidate is the page that will be accessed \emph{latest} in the future---this is the \textbf{Belady's optimal} policy. However, this is impossible to compute in practice because future access patterns are unknown.
+
+The standard approximation is \textbf{Least Recently Used (LRU)}: evict the page that has not been accessed for the longest time. The intuition is that recently-used pages are more likely to be needed again soon (temporal locality). The difficulty is that precise LRU requires tracking a timestamp on every memory access---including every load and store---which imposes prohibitive overhead even when memory is plentiful.
+
+\subsection{Tracking LRU: Complexity Analysis}
+
+To maintain exact LRU, the OS would need to update a data structure on each memory access. The cost of maintaining this structure ranges from $O(n)$ down to $O(1)$ with the right design, but the fundamental problem is that \emph{every} memory access---including reads---would require trapping into the kernel to update the timestamp. This means a page fault on every load and store, which is completely impractical.
+
+\subsection{The Clock Algorithm}
+
+The \textbf{clock algorithm} is a hardware-assisted LRU approximation that avoids per-access traps. Every page table entry (PTE) contains an \textbf{access bit} $a$. The hardware sets $a = 1$ whenever a page is read or written. The OS maintains pages in a \emph{circular list} and advances a ``hand'' pointer when eviction is needed.
+
+The eviction procedure works as follows:
+\begin{enumerate}
+    \item Examine the page at the current hand position.
+    \item If $a = 1$, clear the bit ($a \leftarrow 0$) and advance the hand. This gives the page a second chance.
+    \item If $a = 0$, evict this page. It has not been accessed since the last time the hand passed.
+\end{enumerate}
+
+The key insight connecting hardware and software: when $a = 0$, the OS also clears \texttt{PTE\_P} (the present bit). This causes the next access to the page to generate a \textbf{page fault}, at which point the OS sets $a = 1$ and \texttt{PTE\_P} again. This way, trapping happens only when the access bit needs to be updated from $0$ to $1$---not on every access.
+
+\subsubsection*{Worst-Case Analysis}
+
+If \emph{all} pages have $a = 1$ when eviction begins, the clock hand must sweep the entire circular list, clearing bits one by one, before finding any page to evict. In the worst case this is $O(n)$ where $n$ is the number of pages---but it degenerates only when every page is actively used, exactly the situation where no good eviction candidate exists regardless of algorithm.
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Policy} & \textbf{Characteristic} \\
+\midrule
+Optimal (Belady) & Evict page accessed latest in the future; impractical \\
+LRU (exact) & Evict least-recently used; requires per-access trap \\
+Clock (LRU approx.) & Circular scan with access bit; hardware-assisted, practical \\
+Random & Simple, unpredictable; baseline comparison \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Interrupts, Exceptions, and System Calls}
+% ============================================================
+
+\subsection{Why Interrupts?}
+
+Without interrupts, the only alternative is \textbf{polling}: the CPU repeatedly checks each I/O device to see if it needs attention. For \emph{infrequent} events (e.g., a keystroke) this wastes enormous CPU cycles. For \emph{frequent} events polling may not even be fast enough to keep up. Interrupts solve both problems: the device signals the CPU only when action is required, and the CPU handles it immediately.
+
+Events requiring interrupt handling fall into several categories:
+\begin{itemize}
+    \item \textbf{Exceptions} (synchronous): page faults (vector 14 in x86), arithmetic errors, protection faults.
+    \item \textbf{Hardware interrupts} (asynchronous): timer ticks (vector 32 $\to$ scheduler), disk completion, network packet arrival.
+    \item \textbf{Software interrupts}: the \texttt{INT} instruction, used for system calls in xv6 (\texttt{INT 0x40}).
+    \item \textbf{Non-Maskable Interrupts (NMI)}: power failure, memory corruption; cannot be suppressed.
+    \item \textbf{Debugging}: software breakpoints.
+    \item \textbf{Communication}: Inter-processor interrupts (IPI) on multiprocessor systems.
+\end{itemize}
+
+Every interrupt and exception type is assigned a fixed \textbf{vector number} (0--255). When an interrupt fires, the hardware uses the vector to index into the \textbf{Interrupt Descriptor Table (IDT)} and jump to the registered handler.
+
+\subsection{Types of Interrupts in x86}
+
+\subsubsection*{Non-Maskable Interrupts (NMI)}
+
+\textbf{NMI} (vector 2) is \emph{never} ignored by the CPU, regardless of the interrupt-enable flag. It signals catastrophic hardware events such as memory ECC errors or power failure. In xv6, receiving an NMI causes the kernel to halt---there is no safe recovery path.
+
+\subsubsection*{Maskable Interrupts (INTR)}
+
+\textbf{Maskable interrupts} are suppressed when the \textbf{IF} (interrupt-enable) flag in \texttt{EFLAGS} is cleared. The x86 instructions \texttt{sti} (set interrupt flag) and \texttt{cli} (clear interrupt flag) enable and disable maskable interrupts, respectively. The CPU sends an \textbf{INTA} (interrupt acknowledge) signal back to the hardware controller after handling each maskable interrupt.
+
+The \textbf{Programmable Interrupt Controller (PIC 8259A)} aggregates multiple hardware interrupt lines into the single \texttt{INTR} pin of the CPU. It is responsible for encoding which device triggered the interrupt and presenting the correct vector number.
+
+\subsubsection*{Software Interrupts (INT)}
+
+The \texttt{INT n} instruction deliberately triggers the interrupt handler for vector $n$. It is the x86 mechanism for \textbf{system calls}: xv6 uses \texttt{INT 0x40} to enter the kernel. The complementary instruction \texttt{iret} (interrupt return) restores the saved processor state and returns to user space.
+
+\subsection{The INT Instruction: Step-by-Step}
+
+When \texttt{INT 0x40} executes in user space, the CPU performs the following sequence automatically:
+\begin{enumerate}
+    \item Determine the vector number (0x40).
+    \item Fetch the 8-byte \textbf{IDT descriptor} for that vector from the table whose base address is in the \texttt{IDTR} register.
+    \item Check that the current privilege level (CPL) $\leq$ descriptor privilege level (DPL)---this prevents user code from directly invoking kernel-only handlers.
+    \item If a privilege-level change is required, save \texttt{SS} and \texttt{ESP} internally, then load the kernel \texttt{SS} and \texttt{ESP} from the \textbf{Task State Segment (TSS)}. This switches to the kernel stack.
+    \item Push (in order): user \texttt{SS}, user \texttt{ESP}, user \texttt{EFLAGS}, user \texttt{CS}, user \texttt{EIP}. These form the bottom of the \emph{trap frame}.
+    \item Clear certain \texttt{EFLAGS} bits (e.g., the interrupt-enable flag is cleared to prevent re-entrant interrupts during handler setup).
+    \item Set \texttt{CS} and \texttt{EIP} from the IDT descriptor, transferring control to the handler.
+\end{enumerate}
+
+The net effect is that the hardware automatically saves the minimal state needed to return to user space, and switches to the kernel stack before invoking the handler.
+
+% ============================================================
+\section{Interrupt Handling in xv6}
+% ============================================================
+
+\subsection{High-Level Flow}
+
+Handling any interrupt in xv6 follows this general pattern:
+\begin{enumerate}
+    \item Identify the interrupt vector.
+    \item Verify the interrupt is permitted at the current privilege level.
+    \item Switch from the user stack to the kernel (handler) stack via the TSS.
+    \item Save all user-space registers (building the full \emph{trap frame}).
+    \item Jump to the C trap handler.
+    \item On return, restore the saved registers and execute \texttt{iret} to resume user space.
+\end{enumerate}
+
+\subsection{The Trap Frame (\texttt{x86.h})}
+
+The \textbf{trap frame} is the data structure that captures the complete CPU state at the moment of an interrupt. In xv6, it is defined in \texttt{x86.h}. The lower portion (pushed first) is filled by the hardware during the \texttt{INT} instruction; the upper portion is filled by software in \texttt{trapasm.S}. Together they hold all general-purpose registers, segment registers, and the hardware-pushed \texttt{EIP}/\texttt{CS}/\texttt{EFLAGS}/\texttt{ESP}/\texttt{SS}, providing everything needed to restore user state on \texttt{iret}.
+
+\subsection{xv6 Interrupt Source Files}
+
+The interrupt infrastructure in xv6 spans several files, each with a distinct responsibility:
+
+\begin{itemize}
+    \item \textbf{\texttt{usys.S}}: Defines the user-space system call stubs. Each stub executes \texttt{INT 0x40} to enter the kernel.
+    \item \textbf{\texttt{trapasm.S}}: Contains \texttt{alltraps}, the unified entry point for all interrupts. It pushes the remaining registers to complete the trap frame, then calls the C function \texttt{trap()}. It also contains \texttt{trapret}, which restores state and executes \texttt{iret} to return to user space.
+    \item \textbf{\texttt{vector.S}}: Auto-generated file defining 256 short stubs---one per interrupt vector. Each stub pushes the vector number (and a dummy error code for vectors that do not push one automatically), then jumps to \texttt{alltraps}.
+    \item \textbf{\texttt{trap.c}}: The main C-level trap handler. This file contains the \texttt{trap()} function that dispatches on the vector number, handling system calls, hardware interrupts, and exceptions. It is the file most relevant to Lab 2 and Lab 3.
+\end{itemize}
+
+\subsection{The Interrupt Descriptor Table (IDT)}
+
+The \textbf{IDT} is an array of 256 eight-byte entries analogous to the GDT. Each entry is called a \emph{gate descriptor} and specifies:
+\begin{itemize}
+    \item The handler's segment selector and offset (the address of the handler code).
+    \item The privilege level required to invoke this gate via a software \texttt{INT} instruction.
+    \item The gate type (interrupt gate vs. trap gate; interrupt gates clear \texttt{IF} on entry).
+\end{itemize}
+
+The CPU locates the IDT via the \textbf{IDTR} register, which holds the base address and size of the table. The \texttt{lidt} instruction loads \texttt{IDTR}. In xv6, the IDT is initialized at boot in \texttt{trap.c} using a helper \texttt{SETGATE} macro that populates each descriptor.
+
+% ============================================================
+\section{Introduction to Concurrency}
+% ============================================================
+
+\subsection{Interrupts as Pseudo-Concurrency}
+
+Even on a single CPU, interrupts create a form of \textbf{pseudo-concurrency}: an interrupt handler can run at any point between any two instructions of the main kernel code. If both the interrupted kernel code and the interrupt handler access shared data, a \textbf{race condition} arises. This is logically equivalent to the concurrency problems that occur with multiple threads or processors.
+
+\subsection{The Deadlock Problem with Locks and Interrupts}
+
+Suppose the kernel acquires a spinlock protecting shared data, and then an interrupt fires before the lock is released:
+
+\begin{enumerate}
+    \item Kernel code calls \texttt{Lock()} and acquires the lock.
+    \item Interrupt arrives; the CPU jumps to the interrupt handler.
+    \item The handler also calls \texttt{Lock()} on the \emph{same} lock.
+    \item Since the lock is already held, the handler spins indefinitely---\textbf{deadlock}.
+\end{enumerate}
+
+The handler cannot be made to ignore locks (that would break mutual exclusion). The solution is to \textbf{delay the interrupt}: whenever a spinlock is held, interrupts must be disabled. This is the approach xv6 takes---\texttt{acquire()} calls \texttt{cli} to disable interrupts, and \texttt{release()} calls \texttt{sti} to re-enable them only after the lock is released.
+
+In xv6, the lock primitives therefore have the following structure conceptually:
+
+\begin{lstlisting}[language=C, caption={Interrupt-safe acquire/release in xv6 (conceptual)}]
+acquire(lock):
+    interrupt_disable()   // pushcli in xv6
+    spinlock_acquire(lock)
+
+release(lock):
+    spinlock_release(lock)
+    interrupt_enable()    // popcli in xv6
+\end{lstlisting}
+
+\textbf{Mutual exclusion with an interrupt handler is achieved through interrupt disable.} This is a key design principle in xv6: the combination of spinlocks and \texttt{cli}/\texttt{sti} prevents the interrupt-deadlock scenario entirely.
+
+% ============================================================
+\section{Summary}
+% ============================================================
+
+\begin{itemize}
+    \item \textbf{Clock algorithm}: An LRU approximation using the hardware access bit ($a$) and a circular page list; avoids per-access traps by piggybacking on page faults.
+    \item \textbf{Interrupt vectors}: Every exception and interrupt maps to a vector number (0--255); the IDT maps vectors to kernel handler addresses.
+    \item \textbf{NMI vs.\ INTR vs.\ INT}: Non-maskable interrupts cannot be suppressed; maskable interrupts are controlled by the \texttt{IF} flag (\texttt{sti}/\texttt{cli}); software interrupts (\texttt{INT n}) are used for system calls.
+    \item \textbf{INT instruction mechanics}: Automatically switches to the kernel stack (via TSS), pushes user state onto it, and transfers control to the IDT handler.
+    \item \textbf{xv6 interrupt path}: \texttt{vector.S} $\to$ \texttt{alltraps} (trapasm.S) $\to$ \texttt{trap()} (trap.c) $\to$ \texttt{trapret} $\to$ \texttt{iret}.
+    \item \textbf{IDT}: 256-entry table of gate descriptors; base address loaded into \texttt{IDTR} via \texttt{lidt}; initialized at boot in \texttt{trap.c}.
+    \item \textbf{Pseudo-concurrency}: Interrupts create race conditions on a single CPU; xv6 prevents interrupt-induced deadlock by disabling interrupts while holding spinlocks.
+\end{itemize}
+
+% ============================================================
+\section{References}
+% ============================================================
+
+\begin{itemize}
+    \item Cox, R.; Kaashoek, F.; Morris, R. ``xv6: a simple, Unix-like teaching operating system.'' \textit{MIT CSAIL}. \url{https://pdos.csail.mit.edu/6.828/2018/xv6/book-rev11.pdf}
+    \item Intel. ``Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 3A: System Programming Guide.'' Intel Corporation.
+    \item Arpaci-Dusseau, R. H.; Arpaci-Dusseau, A. C. ``Beyond Physical Memory: Mechanisms.'' \textit{Operating Systems: Three Easy Pieces}. Arpaci-Dusseau Books. \url{https://pages.cs.wisc.edu/~remzi/OSTEP/}
+    \item TutorialsPoint. ``Microprocessor 8086 Interrupts.'' \url{https://www.tutorialspoint.com/microprocessor/microprocessor_8086_interrupts.htm}
+\end{itemize}
+
+% ============================================================
+\section*{Personal Notes}
+% ============================================================
+% Add your own notes below this line
+
+\end{document}

@@ -1,0 +1,279 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{booktabs}
+
+% Code listing style
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray}\itshape,
+    stringstyle=\color{red},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4
+}
+
+\title{\textbf{CS3210: Operating Systems} \\ Lecture 11 --- Concurrency II}
+\author{John Kim \\ Georgia Institute of Technology}
+\date{February 19, 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Recap: Interrupts and Pseudo-Concurrency}
+% ============================================================
+
+As established in Lecture 10, interrupts introduce \textbf{pseudo-concurrency}: on a single CPU, an interrupt handler can execute between any two instructions of kernel code. If both the kernel and the handler touch the same shared data, a race condition arises. The xv6 solution is to \textbf{disable interrupts} while a spinlock is held, tying mutual exclusion to interrupt control.
+
+The correct pattern in xv6 is:
+
+\begin{lstlisting}[language=C, caption={xv6 interrupt-safe locking (conceptual)}]
+// Acquiring a lock
+interrupt_disable();   // pushcli
+acquire_spinlock();
+
+// ... critical section: access shared data ...
+
+// Releasing a lock
+release_spinlock();
+interrupt_enable();    // popcli
+\end{lstlisting}
+
+This ordering is critical: interrupts must be disabled \emph{before} acquiring the spinlock, and re-enabled only \emph{after} releasing it. Inverting the order reintroduces the deadlock risk. \textbf{In xv6, mutual exclusion with interrupt handlers is achieved through interrupt disable}, not by teaching the handler to skip locks.
+
+% ============================================================
+\section{The ``Too Much Milk'' Problem}
+% ============================================================
+
+\subsection{Motivation: Concurrent Updates to Shared State}
+
+The classic \textbf{Too Much Milk} problem is a thought experiment that distills the core difficulty of concurrent programming down to its essence. It illustrates why \textbf{mutual exclusion} is non-trivial even for logically simple operations.
+
+\textbf{Scenario}: Alice and Bob share a refrigerator. They each independently check whether milk is present, and if not, go buy some. The problem is that both may observe an empty fridge simultaneously, both decide to buy milk, and both return to find the fridge full---\emph{too much milk}.
+
+\textbf{Formalization}:
+\begin{itemize}
+    \item \textbf{Shared variable}: The state of the fridge (milk present or not).
+    \item \textbf{``Check fridge''} $\equiv$ read a shared variable.
+    \item \textbf{``Put milk in fridge''} $\equiv$ write a shared variable.
+\end{itemize}
+
+Two correctness properties must hold simultaneously:
+\begin{enumerate}
+    \item \textbf{Safety}: At most one person buys milk at any time (no duplicate purchase).
+    \item \textbf{Liveness}: Someone buys milk when it is needed (no starvation---the fridge is never left empty indefinitely).
+\end{enumerate}
+
+\textbf{The problematic interleaving} is:
+
+\[
+\text{Alice checks} \to \text{Bob checks} \to \text{Alice buys} \to \text{Bob buys}
+\]
+
+Both threads read the ``no milk'' state before either has written the ``milk present'' state. This is a classic \textbf{check-then-act} race: there is a window between the check and the update during which another thread may observe the same stale state.
+
+\subsection{Naive Fix: Leaving a Note}
+
+An intuitive fix is to leave a note before going to the store, signaling intent so the other person can check. However, this has the same problem if both check-before-note steps interleave:
+
+\[
+\text{Alice checks (no milk, no note)} \to \text{Bob checks (no milk, no note)} \to \text{Alice leaves note} \to \text{Bob leaves note}
+\]
+
+Both leave notes; both buy milk. Safety is still violated. Careful reasoning about \emph{all possible interleavings} is required---concurrency bugs occur only for \emph{some} execution interleavings, making them notoriously hard to reproduce and debug.
+
+\textbf{Key design insight}: when constructing a mutual exclusion protocol, be \emph{mindful of what is checked and what is updated}, and whether any other thread can observe shared data \emph{between} the check and the update.
+
+% ============================================================
+\section{Building Locks: From Theory to Hardware}
+% ============================================================
+
+\subsection{Peterson's Algorithm: Locks with Only Atomic Loads/Stores}
+
+\textbf{Peterson's Algorithm} is a classic software-only mutual exclusion protocol for two threads, using only atomic reads and writes to shared variables. It maintains two variables: a \texttt{turn} variable (whose turn it is) and a two-element \texttt{flag} array (indicating each thread's intent to enter the critical section).
+
+While Peterson's algorithm is \emph{theoretically correct} under sequential consistency, it is \textbf{completely impractical} on modern hardware for two reasons:
+\begin{enumerate}
+    \item Modern CPUs do not guarantee sequential consistency---memory reordering (discussed in Section~\ref{sec:memory-models}) can break the algorithm's invariants.
+    \item Spinning on shared memory locations causes cache-coherence traffic, degrading performance.
+\end{enumerate}
+
+A better concurrency primitive requires \textbf{an operation that atomically reads and writes memory in a single indivisible step}.
+
+\subsection{Hardware Atomic Operations}
+
+The C11 standard provides atomic primitives that map directly to hardware instructions:
+\begin{itemize}
+    \item \texttt{atomic\_load()} / \texttt{atomic\_store()}: Atomic read and write.
+    \item \texttt{atomic\_fetch\_add()}: Atomic read-modify-write for addition.
+    \item \texttt{atomic\_exchange()}: \emph{Atomically} reads the old value and writes a new value in a single operation. This is the key primitive for spinlocks.
+    \item \texttt{atomic\_compare\_exchange()}: Conditionally exchange---only writes if the current value matches an expected value. Used for lock-free data structures.
+\end{itemize}
+
+\subsection{Spinlock with \texttt{atomic\_exchange}}
+
+A spinlock can be built directly on \texttt{atomic\_exchange} (which corresponds to the x86 \texttt{XCHG} instruction):
+
+\begin{lstlisting}[language=C, caption={Spinlock using atomic exchange}]
+// Convention: lock == 0 means unlocked, lock == 1 means locked.
+
+void acquire(int *lock) {
+    int r = 1;
+    while (r != 0) {
+        r = exchange(lock, 1);  // atomically set lock=1, get old value
+    }
+    // Loop exits when we read a 0, meaning we were the ones to set it to 1
+}
+
+void release(int *lock) {
+    exchange(lock, 0);          // atomically set lock=0
+}
+\end{lstlisting}
+
+\textbf{Correctness analysis}: The key is that \texttt{exchange} is \emph{atomic}---no two threads can simultaneously read a 0 and both succeed. Exactly one thread reads the old value 0 (unlocked) and sets the lock to 1; all other threads see 1 and continue spinning. The possible states of \texttt{(lock, return\_value)} are:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{State} & \textbf{Meaning} \\
+\midrule
+\texttt{lock=0, exchange returns 0} & Lock was free; this thread acquires it \\
+\texttt{lock=1, exchange returns 1} & Lock was held; thread keeps spinning \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Memory Models and Reordering}
+\label{sec:memory-models}
+% ============================================================
+
+\subsection{The Reordering Problem}
+
+Consider two threads $T_1$ and $T_2$ running concurrently on a multiprocessor, with initial values $x = y = 0$:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Thread T1} & \textbf{Thread T2} \\
+\midrule
+\texttt{movl \$1, (x)} & \texttt{movl \$1, (y)} \\
+\texttt{movl (y), \%eax} & \texttt{movl (x), \%ebx} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Under \textbf{sequential consistency}---the intuitive model where instructions execute in some global total order---the only outcome that \emph{cannot} occur is \texttt{\%eax = 0, \%ebx = 0}, because at least one of the stores must happen before the other thread's load. The possible outcomes are: $(0,1)$, $(1,0)$, or $(1,1)$.
+
+However, x86 actually permits \texttt{\%eax = 0, \%ebx = 0}. How? Because x86 uses a weaker memory model called \textbf{Total Store Order (TSO)}.
+
+\subsection{Total Store Order (TSO)}
+
+\textbf{TSO} is the x86 memory consistency model. Its key property is that each CPU core buffers its stores in a local \textbf{store buffer} before they become globally visible. Loads from other cores can bypass the store buffer and see stale values, which is equivalent to allowing loads to be reordered \emph{before} prior stores to different addresses.
+
+TSO guarantees the following orderings:
+\begin{itemize}
+    \item \textbf{Write $\to$ Write} (W-W): Stores from a single core are seen in order by all cores.
+    \item \textbf{Read $\to$ Write} (R-W): A load cannot be reordered after a later store from the same core.
+\end{itemize}
+
+TSO does \emph{not} guarantee:
+\begin{itemize}
+    \item \textbf{Write $\to$ Read} (W-R): A store may not be visible before a subsequent load from a different address completes. This is the source of the $(0, 0)$ outcome above---both cores issue their store and immediately load from the \emph{other} address before either store has propagated.
+\end{itemize}
+
+\subsection{Sequential Consistency vs. TSO vs. DRF0}
+
+Programmers naturally assume \textbf{sequential consistency} (SC): every instruction executes in program order, and all threads see a single consistent interleaving. This assumption is \emph{wrong} at the hardware level:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Model} & \textbf{Guarantee} \\
+\midrule
+Sequential Consistency & All operations execute in program order, globally visible \\
+Total Store Order (TSO) & Stores buffered; W-R reordering permitted \\
+DRF0 (C11) & SC \emph{if} program has no data races; undefined otherwise \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The \textbf{Data-Race-Free zero (DRF0)} model offered by C11 is the programmer-facing contract: \emph{if your program contains no data races} (all shared accesses are protected by locks or done with C11 atomics), then the language guarantees sequentially-consistent behavior. Conversely, any data race results in undefined behavior---the compiler and hardware are free to produce any result.
+
+\textbf{Key takeaway}: Do not rely on sequential consistency. Write concurrent code with proper synchronization primitives (locks, semaphores, condition variables). In very rare, performance-critical cases, C11 atomic primitives may be used directly, but these are subtle and dangerous.
+
+\subsection{Why $(0, 0)$ Is Possible Under TSO}
+
+In the earlier two-thread example, the sequence of events that produces $\%\texttt{eax} = 0$, $\%\texttt{ebx} = 0$ is:
+
+\begin{enumerate}
+    \item $T_1$ issues \texttt{movl \$1, (x)}---the store enters $T_1$'s store buffer but is not yet globally visible.
+    \item $T_2$ issues \texttt{movl \$1, (y)}---similarly buffered.
+    \item $T_1$ issues \texttt{movl (y), \%eax}---reads $y = 0$ from memory (before $T_2$'s store propagates).
+    \item $T_2$ issues \texttt{movl (x), \%ebx}---reads $x = 0$ from memory (before $T_1$'s store propagates).
+    \item Both stores eventually flush: $x = y = 1$, but the loads already completed with stale values.
+\end{enumerate}
+
+This is not a bug in the hardware---it is a documented and intentional feature of TSO that enables significant performance optimizations through store buffering.
+
+% ============================================================
+\section{Writing Correct Concurrent Code}
+% ============================================================
+
+The conclusion of the memory-model analysis is that writing correct concurrent code requires \textbf{proper synchronization primitives}:
+
+\begin{itemize}
+    \item \textbf{Locks (mutexes)}: Ensure mutual exclusion. The most common tool for protecting shared data structures.
+    \item \textbf{Semaphores}: Generalized signaling mechanism; a lock is a binary semaphore.
+    \item \textbf{Condition variables}: Allow threads to sleep until a condition becomes true, avoiding busy-waiting.
+    \item \textbf{Barriers}: Synchronize a group of threads to a common point before proceeding.
+    \item \textbf{C11 atomics} (with caution): Low-level primitives (\texttt{atomic\_exchange}, \texttt{atomic\_compare\_exchange}) that map to hardware instructions. Useful for building lock-free data structures, but semantics are subtle and mistakes are hard to detect.
+\end{itemize}
+
+All of the higher-level primitives (locks, semaphores, condition variables) are ultimately built on top of hardware atomic operations. The DRF0 contract guarantees that if these primitives are used correctly---with no unprotected shared accesses---the program behaves as if it were sequentially consistent, regardless of the underlying TSO reordering.
+
+% ============================================================
+\section{Summary}
+% ============================================================
+
+\begin{itemize}
+    \item \textbf{Interrupt-safe locking}: xv6 disables interrupts (\texttt{pushcli}) before acquiring spinlocks to prevent interrupt-induced deadlock; re-enables them (\texttt{popcli}) only after release.
+    \item \textbf{Too Much Milk}: A canonical example showing that check-then-act on shared state requires mutual exclusion; concurrency bugs manifest only in specific interleavings.
+    \item \textbf{Peterson's Algorithm}: A software-only solution to mutual exclusion that is theoretically correct under SC but impractical on real hardware due to memory reordering.
+    \item \textbf{Atomic exchange}: The hardware primitive enabling practical spinlocks; \texttt{atomic\_exchange(lock, 1)} atomically reads the old value and sets the lock in one indivisible step.
+    \item \textbf{Total Store Order (TSO)}: The x86 memory consistency model; allows write-read reordering via store buffers, making outcomes like $(0,0)$ possible even when sequential consistency would forbid them.
+    \item \textbf{DRF0}: C11's programmer contract---data-race-free programs behave as sequentially consistent; any data race causes undefined behavior.
+    \item \textbf{Correct concurrency}: Always use proper synchronization (locks, semaphores, condition variables); raw C11 atomics are dangerous and should be reserved for expert, performance-critical use cases.
+\end{itemize}
+
+% ============================================================
+\section{References}
+% ============================================================
+
+\begin{itemize}
+    \item Cox, R.; Kaashoek, F.; Morris, R. ``xv6: a simple, Unix-like teaching operating system.'' \textit{MIT CSAIL}. \url{https://pdos.csail.mit.edu/6.828/2018/xv6/book-rev11.pdf}
+    \item cppreference.com. ``C atomic operations library (C11).'' \url{https://en.cppreference.com/w/c/atomic}
+    \item Wikipedia. ``Peterson's Algorithm.'' \url{https://en.wikipedia.org/wiki/Peterson%27s_algorithm}
+    \item Adve, S.; Gharachorloo, K. ``Shared Memory Consistency Models: A Tutorial.'' \textit{IEEE Computer}. 1996.
+    \item Sewell, P. et al. ``x86-TSO: A Rigorous and Usable Programmer's Model for x86 Multiprocessors.'' \textit{CACM}. 2010.
+\end{itemize}
+
+% ============================================================
+\section*{Personal Notes}
+% ============================================================
+% Add your own notes below this line
+
+\end{document}
