@@ -1,0 +1,469 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{booktabs}
+
+% Code listing style
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray}\itshape,
+    stringstyle=\color{red},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4
+}
+
+\title{\textbf{CS3210: Operating Systems} \\ Lecture 14 --- User and Kernel Threads}
+\author{John Kim \\ Georgia Institute of Technology}
+\date{March 2, 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{A Note on Weak Ordering}
+% ============================================================
+
+\subsection{Weak Order Semantics}
+
+\textbf{Weak ordering} (also called \emph{relaxed consistency}) describes a property of modern hardware and compilers: they are permitted to reorder reads and writes as long as the result remains correct \emph{from the perspective of the executing thread itself}. The important caveat is that weak ordering does \emph{not} concern itself with correctness across concurrently executing threads.
+
+In practice this means:
+\begin{itemize}
+    \item Stores performed by one thread can appear to arrive out of order as observed by another thread.
+    \item A thread might see another thread's writes to different variables at different times, depending on caching and pipeline effects.
+    \item Without explicit synchronization, almost no ordering guarantees exist between threads.
+\end{itemize}
+
+\subsection{Lock Acquire/Release as a Partial-Order Mechanism}
+
+The primary tool for imposing order is the \textbf{lock acquire/release} pair:
+\begin{itemize}
+    \item \textbf{Acquire} $\rightarrow$ all subsequent reads and writes in the current thread are guaranteed to happen \emph{after} the acquire, as seen by any other thread that later acquires the same lock.
+    \item \textbf{Release} $\rightarrow$ all preceding reads and writes in the current thread are guaranteed to happen \emph{before} the release, again as seen by any thread that later acquires the lock.
+\end{itemize}
+
+This gives us a \emph{partial} ordering of memory operations, not a total one.
+
+\subsection{Race Conditions and Ordering}
+
+Consider a classic race condition in a linked-list \texttt{insert} function. Two threads, $t_1$ and $t_2$, both call \texttt{insert} concurrently on a shared global list:
+
+\begin{lstlisting}[language=C, caption={Linked list with race condition}]
+struct list {
+    int data;
+    struct list *next;
+};
+
+struct list *list = 0;
+
+void insert(int data) {
+    struct list *l;
+    l = malloc(sizeof *l);
+    l->data = data;
+    l->next = list;
+    list = l;
+}
+\end{lstlisting}
+
+Without synchronization, the interleaving of \texttt{l->next = list} and \texttt{list = l} between the two threads can produce a corrupted list in which one node is lost. The root cause is that the assignment to the global \texttt{list} pointer is not atomic.
+
+The three levels of ordering relevant here are:
+
+\begin{itemize}
+    \item \textbf{Unordered}: Operations from $t_1$ and $t_2$ may interleave in any order ($\text{Rt}_1, \text{Rt}_2, \text{Wt}_1, \text{Wt}_2$ in any sequence).
+    \item \textbf{Partially ordered} (with locks): Locks enforce that within each critical section the operations are totally ordered, but the two critical sections may execute in either sequence ($\text{Rt}_1, \text{Wt}_1, \text{Rt}_2, \text{Wt}_2$ or $\text{Rt}_2, \text{Wt}_2, \text{Rt}_1, \text{Wt}_1$).
+    \item \textbf{Fully ordered}: Exactly one globally visible sequence of all operations exists, as in sequential consistency.
+\end{itemize}
+
+Adding acquire/release around the critical section (the read and write of \texttt{list}) restores safety: only one thread modifies \texttt{list} at a time, preventing the lost-update race.
+
+% ============================================================
+\section{Threading: Definition and Motivation}
+% ============================================================
+
+\subsection{Why Threading?}
+
+The most frequently cited reason for adopting threads is \emph{performance}: multiple threads can overlap computation and I/O, keeping CPUs busy. However, multi-processing can achieve similar throughput gains. Threading offers additional benefits that processes alone cannot:
+
+\begin{itemize}
+    \item \textbf{Parallelism with shared memory}: Threads within a process share the same address space, eliminating the overhead of inter-process communication for shared data. A secondary benefit is more efficient context switching compared to full process switches, because no page-table swap is required.
+    \item \textbf{Concurrency on a single core}: Even on a uniprocessor, a multithreaded program makes it easier to organize and respond to asynchronous events. Multiple threads give the programmer the \emph{abstraction} of concurrency even when true hardware parallelism is absent.
+\end{itemize}
+
+Threading also introduces challenges: \textbf{synchronization} (preventing races and ensuring ordering) and the inherent difficulty of \textbf{testing and debugging} concurrent programs.
+
+\subsection{Threading as an Abstraction of Concurrency}
+
+At a high level, \textbf{threading is a mechanism}---specifically, a mechanism for concurrency. More precisely, threading is an \emph{abstraction} of concurrency that gives the programmer the ability to execute independent threads at the same time, whether or not the hardware actually runs them in parallel.
+
+\subsection{Other Mechanisms of Concurrency}
+
+Threading is not the only concurrency mechanism. Two alternatives are:
+
+\begin{itemize}
+    \item \textbf{Multiprocessing}: Multiple processes share compute resources (the CPUs) but \emph{not} memory. The key guaranteed property is \textbf{memory space isolation}---one process cannot accidentally (or maliciously) corrupt another's address space.
+    \item \textbf{Event-based systems}: A single process with a single thread voluntarily yields control at well-defined points (e.g., before blocking I/O). Node.js is a well-known example. This model is simple and avoids data races, but it provides no true hardware parallelism.
+\end{itemize}
+
+\subsection{Threads as a Mechanism of Concurrency}
+
+The key design insight is: \emph{what if we deliberately break the memory isolation guarantee that processes provide?} The answer is threads. The \textbf{key insight} is that threads \emph{share memory resources by design}. This shared address space is the defining property that distinguishes a thread from a process.
+
+\subsection{Defining Threads}
+
+Two complementary definitions from the literature:
+
+\begin{enumerate}
+    \item A \emph{thread of execution} is the smallest sequence of programmed instructions that can be managed independently by a scheduler.
+    \item A thread, sometimes called a \emph{lightweight process}, is a basic unit of CPU utilization; it comprises a thread ID, a program counter, a register set, and a stack.
+\end{enumerate}
+
+The defining structural property is: \textbf{threads within the same process share the same memory (address space, heap, globals)}, while each thread has its own stack and register state.
+
+\subsection{Benefits of Threads}
+
+Four classical benefits of threading are:
+
+\begin{itemize}
+    \item \textbf{Responsiveness}: Threads are especially beneficial for interactive applications. A foreground thread can respond to user input while background threads perform long-running work, providing the abstraction of concurrency to the user.
+    \item \textbf{Resource sharing}: Threads share memory and resources by design. In contrast, processes have separate address spaces; sharing data between them requires explicit IPC (pipes, shared memory segments, etc.).
+    \item \textbf{Economy}: Thread creation and destruction is much faster than process creation. Context switching between threads has less overhead because there is no page-table switch.
+    \item \textbf{Multiprocessors}: On a system with multiple CPUs, threads can achieve \emph{true} parallelism rather than merely the single-processor illusion of time-sharing.
+\end{itemize}
+
+\subsection{Design Considerations for Supporting Threads}
+
+Providing threading support requires answering several questions:
+\begin{itemize}
+    \item How do we best structure and enable threading in the operating system?
+    \item What is the interface for thread creation, destruction, and management?
+    \item What is the real difference between a thread and a process? Does there \emph{need} to be one?
+\end{itemize}
+
+The last question is particularly interesting from an OS design perspective. Linux, for instance, treats threads and processes as the same underlying abstraction (\emph{tasks}), differing only in the degree of resource sharing.
+
+% ============================================================
+\section{Threading Design Tradeoffs}
+% ============================================================
+
+The central design question is how \textbf{user-level threads} (the programming abstraction) map onto \textbf{kernel-level threads} (the schedulable entities the OS manages). Three classical models exist.
+
+\subsection{One-to-One (1:1) --- Kernel Threading}
+
+In the \textbf{one-to-one} model, each user thread is backed by exactly one kernel thread. This is also called \emph{kernel threading} and is the model used by Linux (via pthreads/NPTL), Windows, and most modern operating systems.
+
+\textbf{Attributes:}
+\begin{itemize}
+    \item \emph{Improved concurrency}: Multiple threads can run truly in parallel on a multiprocessor.
+    \item \emph{Can run in parallel}: The OS scheduler can assign different kernel threads to different CPUs simultaneously.
+    \item \emph{Additional overhead}: Creating a user thread requires creating a kernel thread, which involves a system call and kernel data structures.
+\end{itemize}
+
+\subsection{Many-to-One --- User Space Threading}
+
+In the \textbf{many-to-one} model, many user-level threads are multiplexed onto a single kernel thread by a user-space thread library. The kernel is completely unaware of the individual user threads and schedules the entire process as a single entity.
+
+\textbf{Attributes:}
+\begin{itemize}
+    \item Maps many user threads to one kernel thread; simple and efficient at the library level.
+    \item True concurrency is difficult: if one user thread makes a blocking system call, it blocks the \emph{entire} kernel thread, freezing all other user threads.
+    \item Only one thread can access the kernel at a time; no parallelism on multiprocessors.
+\end{itemize}
+
+\subsubsection*{How a User Space Threading Library Works}
+
+A user-space thread library works roughly the same way xv6 manages kernel threads internally: it uses a \texttt{swtch()}-style context switch to swap register state, a scheduler to choose which user thread runs next, and concurrency primitives built from atomics and queues---all without any hardware protection boundaries. Crucially, such a library can still implement most of the threading machinery in user space. The question is what primitives it \emph{cannot} implement without kernel help.
+
+The blocking-I/O problem illustrates the limit. If Thread~1 calls \texttt{sleep(100)} and Thread~2 calls \texttt{read(network, buf)}, a many-to-one library has no way to run Thread~1's remaining work while Thread~2's \texttt{read} system call is blocking inside the kernel. The kernel sees only one process and blocks it entirely.
+
+\subsubsection*{User Space Threading Tradeoffs}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Pros} & \textbf{Cons} \\
+\midrule
+More efficient: no heavy kernel constructs & Cannot use 2+ CPUs without kernel help \\
+No user-kernel switch for thread data & Needs kernel support for preemptive threading \\
+More flexible per-application scheduling & No direct control over sleeping \\
+ & File I/O can freeze all threads \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Kernel Space vs.\ User Space Threading}
+
+The choice between where to manage threads involves a direct tradeoff of capabilities:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Kernel Space} & \textbf{User Space} \\
+\midrule
+True parallelism & Semantically-aware (application-level) scheduling \\
+Preemption possible & Lower context-switching overhead \\
+More information available to scheduler & Better cache locality \\
+Ability to control resource utilization & Lighter weight than kernel threading \\
+ & Lower overhead of thread creation \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Many-to-Many (M:N) --- Hybrid Threading}
+
+The \textbf{many-to-many} model (also called \emph{M:N} or \emph{hybrid threading}) attempts to get the best of both worlds: $M$ user threads are multiplexed over $N$ kernel threads, where $N \leq M$. The user-space library schedules user threads onto available kernel threads, and the OS schedules the kernel threads onto CPUs.
+
+\textbf{Advantages of M:N:}
+\begin{itemize}
+    \item User-space threads can run \emph{in parallel} (unlike pure many-to-one).
+    \item Fewer kernel context switches than one-to-one.
+    \item Lightweight user-space thread creation (small per-thread cost).
+\end{itemize}
+
+\textbf{Disadvantages:}
+\begin{itemize}
+    \item Still subject to kernel thread stalls: a blocking system call on one kernel thread can block all user threads mapped to it.
+    \item Still not fully cooperative use of the CPU---the user-space scheduler has limited visibility into kernel scheduling decisions.
+\end{itemize}
+
+\subsection{Modern Threading Libraries}
+
+Most modern threading libraries (e.g., POSIX pthreads on Linux) use \emph{kernel} threading (1:1), but implement many operations in user space to reduce overhead. The key kernel primitive enabling this is the \textbf{\texttt{futex}} (Fast Userspace muTEX) system call:
+
+\begin{itemize}
+    \item A futex is essentially a kernel sleep/wakeup mechanism exposed to user space.
+    \item It allows user space to implement locking---checking and setting an atomic integer---entirely in user space when there is no contention. Only when contention occurs does the thread call into the kernel to sleep or wake another thread.
+    \item This creates an efficient tradeoff: the \emph{kernel} manages I/O sleeping, process sleeping, and scheduling, while \emph{user space} manages most concurrency primitives (locks, condition variables, semaphores).
+\end{itemize}
+
+\subsection{Scheduler Activations}
+
+\textbf{Scheduler activations} (Anderson et al., 1991) represent one concrete approach to realizing M:N scheduling. The core idea is to introduce a \emph{communication mechanism} between kernel space and user space:
+
+\begin{itemize}
+    \item The kernel notifies the application's user-space thread scheduler of kernel events that affect the address space (e.g., a thread blocking on I/O, a new CPU being assigned). This notification is called an \emph{upcall}.
+    \item In response, the user-space scheduler can modify its thread data structures, run another thread, and make requests back to the kernel.
+\end{itemize}
+
+Scheduler activations were implemented in NetBSD but ultimately abandoned, and were also attempted in Linux 2.4.x. The complexity of the kernel--user communication protocol---and the difficulty of handling all edge cases correctly---made the approach difficult to maintain in practice.
+
+\subsubsection*{Modern Renditions of Scheduler Activations}
+
+The idea has seen a resurgence in systems research:
+\begin{itemize}
+    \item \textbf{ghOSt} (SOSP'21, Google): A framework in which the kernel delegates CPU scheduling decisions for a set of threads to a user-space agent process. The kernel sends thread/CPU messages to the agent via shared memory; the agent makes scheduling decisions and sends them back via transactions and system calls.
+    \item \textbf{Arachne} (OSDI'18, Stanford): A user-level threading system in which a core arbiter communicates with each application using shared memory and sockets. Applications can use custom thread libraries and per-application scheduling policies layered on top of the arbiter.
+\end{itemize}
+
+Both systems illustrate how the semantic gap between kernel and application can be addressed without fully committing to user-space threading.
+
+\subsection{Why Kernel Threads Have (Mostly) Won}
+
+Despite the theoretical appeal of user-space and hybrid threading, the 1:1 kernel-threading model has become the near-universal standard. Three reasons explain this:
+
+\begin{enumerate}
+    \item \textbf{Blocking system calls}: Multiple user threads sharing a single kernel thread are inherently limited. A single blocking system call (e.g., a network \texttt{read}) blocks the entire kernel thread and therefore all user threads mapped to it.
+    \item \textbf{Semantic gap / poor scheduling decisions}: The kernel has no awareness of user-level thread structure, leading to suboptimal scheduling. This is sometimes called the \emph{semantic gap} or lack of \emph{semantic awareness}.
+    \item \textbf{True parallelism}: With pure user-space threading, each process has access to at most one CPU at a time, making it impossible to exploit multiple cores within a single process.
+\end{enumerate}
+
+% ============================================================
+\section{Threading Support in Modern Operating Systems}
+% ============================================================
+
+\subsection{Threading Models Across Systems}
+
+The evolution of threading support varies substantially across operating systems. Most modern systems have converged on the 1:1 kernel-threading model:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Operating System} & \textbf{Introduced} & \textbf{Model} & \textbf{Notes} \\
+\midrule
+Minix          & 1987  & N/A           & It's complicated \\
+Linux (LinuxThreads) & 1996 & 1:1      & \\
+Linux (NPTL)   & 2003  & 1:1           & \\
+macOS/iOS      & $\sim$2000 & 1:1ish   & Built on Mach Threads, BSD layer \\
+FreeBSD        & 2003  & M:N or 1:1    & 1:1 default/recommended since 2006 \\
+DragonFly BSD  & 2007  & 1:1           & \\
+NetBSD         & 2009  & 1:1           & 1:1 since 5.0 (circa 2009) \\
+OpenBSD        & 2012  & 1:1           & Replaced M:N \\
+Solaris        & 2000  & M:N then 1:1  & \\
+HP-UX          & 1997  & M:N or 1:1    & \\
+Windows        & 1993  & 1:1           & \\
+Fuchsia        & 2016  & 1:1           & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The historical trend is clear: systems that initially adopted M:N threading (NetBSD, OpenBSD, Solaris, FreeBSD) have largely migrated to 1:1, confirming that the complexity of M:N rarely justifies the theoretical benefits in practice.
+
+\subsection{Threads in Linux: A Concrete Example}
+
+The following example creates \texttt{NUM\_THREADS} POSIX threads using \texttt{pthread\_create}, each of which prints its process ID and thread ID before sleeping:
+
+\begin{lstlisting}[language=C, caption={Hello World with pthreads (adapted from Purdue ECE563)}]
+#define NUM_THREADS 5
+
+void *TaskCode(void *argument) {
+    int tnum;
+    pid_t pid = getpid();
+    pid_t tid = syscall(SYS_gettid);
+
+    tnum = *((int *) argument);
+    printf("Hello World from thread #%d! My PID is %d and my TID is %d\n",
+           tnum, pid, tid);
+    sleep(600);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t threads[NUM_THREADS];
+    int thread_args[NUM_THREADS];
+    int rc, i;
+    for (i = 0; i < NUM_THREADS; ++i) {
+        thread_args[i] = i;
+        printf("[Parent PID %d]: In main, creating thread %d\n", getpid(), i);
+        rc = pthread_create(&threads[i], NULL, TaskCode, (void *) &thread_args[i]);
+        assert(0 == rc);
+    }
+}
+\end{lstlisting}
+
+Notably, all threads share the same PID (they belong to the same process), but each has a distinct TID (thread group ID). Running \texttt{ps -T -o pid,tgid,tid,cmd -p \textit{PID}} from another terminal shows all six kernel threads (the main thread plus five created threads) with the same PID and TGID but sequential TIDs---confirming the 1:1 mapping between user threads and kernel threads in Linux.
+
+% ============================================================
+\section{Threading in xv6}
+% ============================================================
+
+\subsection{xv6's Current Threading Model}
+
+xv6 does not currently support user threads. Its threading model is minimal:
+\begin{itemize}
+    \item \textbf{Kernel stack}: Each process has its own kernel stack, which serves as the kernel-side execution context.
+    \item \textbf{User threads}: There are none. Each xv6 process is a single-threaded entity from the user's perspective.
+    \item \textbf{Scheduler awareness}: xv6's scheduler has no awareness of symmetric multiprocessing (SMP). It has no SMP support; the scheduler is effectively uniprocessor.
+\end{itemize}
+
+\subsection{Adding Kernel Thread Support to xv6}
+
+To extend xv6 with 1:1 kernel thread support (as in Lab 3), three categories of additions are needed:
+
+\begin{enumerate}
+    \item \textbf{Schedulability}: Threads must be visible to the scheduler---meaning each thread must have its own kernel-side context (stack, register set) and appear in the process table as a runnable entity.
+    \item \textbf{Performance advantages}: Threads must share memory. This means sharing the page directory (\texttt{pgdir}) so all threads within a process map to the same physical address space.
+    \item \textbf{Synchronization primitives}: Threads that share memory need coordinated access. The required primitives are:
+    \begin{itemize}
+        \item \emph{Waiting}: \texttt{waitpid}, \texttt{thread\_wait}
+        \item \emph{Spinlocks}: \texttt{init}, \texttt{acquire}, \texttt{release}
+        \item \emph{Mutexes}: \texttt{park}/\texttt{setpark}/\texttt{unpark}, mutex \texttt{init}/\texttt{acquire}/\texttt{release}
+        \item \emph{Condition variables}: \texttt{cond\_wait}, \texttt{cond\_signal}
+    \end{itemize}
+\end{enumerate}
+
+\subsection{The \texttt{clone()} System Call}
+
+The mechanism for creating a thread in xv6 is a new system call, \texttt{clone()}, modeled after the Linux \texttt{clone()} system call. In Linux, \texttt{clone()} is the single underlying primitive that implements \emph{both} thread and process creation:
+
+\begin{itemize}
+    \item \texttt{fork()} creates a new process with its \emph{own} memory space (copy-on-write). Internally, Linux implements \texttt{fork()} via \texttt{clone()} with flags that specify a new memory space.
+    \item \texttt{clone()} with \texttt{CLONE\_VM} creates a new task that \emph{shares} the parent's memory space---this is a thread.
+\end{itemize}
+
+Every Linux task is a schedulable entity; whether it is a ``process'' or a ``thread'' is determined entirely by which resources it shares with its creator.
+
+The Linux \texttt{clone()} system call signature is:
+\begin{lstlisting}[language=C, caption={Linux clone() system call}]
+long clone(unsigned long flags, void *child_stack,
+           void *ptid, void *ctid,
+           struct pt_regs *regs);
+\end{lstlisting}
+
+And the library-level wrapper exposed to user programs:
+\begin{lstlisting}[language=C, caption={Linux clone() library function}]
+int clone(int (*fn)(void *), void *child_stack,
+          int flags, void *arg, ...
+          /* pid_t *ptid, struct user_desc *tls, pid_t *ctid */ );
+\end{lstlisting}
+
+The extensive list of \texttt{CLONE\_*} flags (including \texttt{CLONE\_VM}, \texttt{CLONE\_FILES}, \texttt{CLONE\_SIGHAND}, \texttt{CLONE\_THREAD}, and many others) controls exactly which resources the new task shares with its parent. This flag-based design is what allows a single system call to express the full spectrum from a fully isolated new process to a fully shared new thread.
+
+\subsection{Clone in xv6}
+
+For Lab 3, xv6 uses a simplified \texttt{clone()} interface:
+
+\begin{lstlisting}[language=C, caption={xv6 clone() interface}]
+int clone(void *stack, int size);
+\end{lstlisting}
+
+The implementation is similar to \texttt{fork()}, with one critical difference: instead of duplicating the parent's address space (with copy-on-write), \texttt{clone()} in xv6 \emph{reuses the parent's page directory entirely}. Both the parent and the new thread thus share the same physical memory mapping. The \texttt{stack} argument allows the caller to supply a pre-allocated stack region for the new thread to use.
+
+\subsection{Pthreads in xv6}
+
+The standard POSIX thread creation interface is \texttt{pthread\_create}:
+
+\begin{lstlisting}[language=C, caption={POSIX pthread\_create interface}]
+int pthread_create(pthread_t *thread,
+                   const pthread_attr_t *attr,
+                   void *(*start_routine)(void *),
+                   void *arg);
+\end{lstlisting}
+
+For xv6, a simpler \texttt{thread\_create} wrapper is provided that hides stack allocation and the \texttt{clone()} call:
+
+\begin{lstlisting}[language=C, caption={xv6 thread\_create interface}]
+thread_create(void *(*start_routine)(void *),
+              void *arg)
+\end{lstlisting}
+
+This wrapper allocates a stack page, calls \texttt{clone(stack, size)}, and arranges for the new thread to begin execution at \texttt{start\_routine(arg)}, presenting the programmer with an interface analogous to POSIX pthreads.
+
+% ============================================================
+\section{Summary}
+% ============================================================
+
+\begin{itemize}
+    \item \textbf{Weak ordering}: Hardware and compilers may reorder memory operations for performance; without explicit synchronization, cross-thread ordering guarantees are almost nonexistent. Lock acquire/release provides partial ordering.
+    \item \textbf{Threads vs.\ processes}: The defining property of a thread is \emph{shared memory by design}. Threads share address space; processes are isolated. This tradeoff enables efficient communication at the cost of requiring synchronization.
+    \item \textbf{Benefits of threading}: Responsiveness, resource sharing, economy of creation/switching, and potential true parallelism on multiprocessors.
+    \item \textbf{One-to-One (1:1)}: Each user thread is backed by a kernel thread. Enables true parallelism and correct blocking semantics. Standard in Linux (NPTL), Windows, macOS, and most modern OSes.
+    \item \textbf{Many-to-One}: User threads multiplexed on one kernel thread. Efficient but no parallelism and blocking calls freeze all threads.
+    \item \textbf{Many-to-Many (M:N)}: Hybrid model offering partial parallelism and efficiency. Complex to implement correctly; most systems have abandoned it in favor of 1:1.
+    \item \textbf{Scheduler activations}: A communication mechanism between kernel and user-space scheduler. Theoretically elegant; abandoned in practice due to complexity. Modern relatives include ghOSt and Arachne.
+    \item \textbf{Kernel threads have mostly won}: Blocking syscalls, the semantic gap, and the need for true parallelism make 1:1 the practical winner.
+    \item \textbf{\texttt{clone()} in Linux and xv6}: Both threads and processes are created via \texttt{clone()}, which unifies them as tasks differing only in their degree of resource sharing. The xv6 Lab 3 \texttt{clone()} reuses the parent's page directory to achieve shared memory.
+\end{itemize}
+
+% ============================================================
+\section{References}
+% ============================================================
+
+\begin{itemize}
+    \item Anderson, T. E. et al. ``Scheduler Activations: Effective Kernel Support for the User-Level Management of Parallelism.'' \textit{ACM Transactions on Computer Systems}. 1992. \url{https://web.eecs.umich.edu/~mosharaf/Readings/Scheduler-Activations.pdf}
+    \item Silberschatz, A.; Galvin, P. B.; Gagne, G. (1999). \textit{Applied Operating System Concepts}. John Wiley \& Sons.
+    \item Ghavami, B. et al. ``ghOSt: Fast \& Flexible User-Space Delegation of Linux Scheduling.'' \textit{SOSP 2021}.
+    \item Qin, H. et al. ``Arachne: Core-Aware Thread Management.'' \textit{OSDI 2018}.
+    \item Wikipedia contributors. ``Thread (computing).'' \textit{Wikipedia}. \url{https://en.wikipedia.org/wiki/Thread_(computing)}
+    \item Adapted pthreads example from: \url{https://engineering.purdue.edu/~eigenman/ECE563/Handouts/helloworld-pthreads.c}
+    \item Unix history diagram: Eraserhead1, Infinity0, Sav\_vas. Levenez Unix History Diagram. CC BY-SA 3.0. \url{https://commons.wikimedia.org/w/index.php?curid=1801948}
+\end{itemize}
+
+% ============================================================
+\section*{Personal Notes}
+% ============================================================
+% Add your own notes below this line
+
+\end{document}
