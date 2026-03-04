@@ -1,0 +1,432 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{booktabs}
+
+% Code listing style
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray}\itshape,
+    stringstyle=\color{red},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4
+}
+
+\title{\textbf{CS3210: Operating Systems} \\ Lecture 2 --- xv6: A Short Introduction to a Small OS}
+\author{John Kim \\ Georgia Institute of Technology}
+\date{January 15, 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Administrative Notes}
+% ============================================================
+
+Before diving into technical content, the lecture addressed several housekeeping items relevant to the first weeks of the semester.
+
+\subsection{Upcoming Deadlines}
+
+The intro card (a short personal introduction for the instructor) was due Friday, January 16 on Gradescope, and had already received 95+ submissions---a pleasing turnout. The diagnostic quiz was also due Friday, January 16, though it had only received 70+ submissions at the time of lecture. Students who had not yet completed the quiz were urged to do so, as it simultaneously serves as the Phase II registration checkpoint.
+
+\textbf{Lab 0} (Get to Know XV6) was released Friday, January 16 and is due Friday, January 23---a one-week turnaround. \textbf{Lab 1} (Startup, CPU Stacks, Debugging, Physical Memory) will be assigned January 23 and is due Friday, February 6, giving students approximately 14 days.
+
+\subsection{MLK Day and Lecture Synchronization}
+
+There will be no class on Monday, January 19 (MLK Day) for either Section A or Section B. The January 19--20 cancellation is intentional: it keeps both sections in sync with respect to lecture material, so that no section falls behind the other due to the holiday.
+
+\subsection{Course Infrastructure}
+
+Lab submissions are managed through \textbf{Gradescope} (\url{https://www.gradescope.com/courses/1222433}), accessible directly or via the left navigation panel in Canvas. Supervised lab quizzes and exams are administered through \textbf{Canvas}. The course discussion forum is hosted on \textbf{Piazza} (\url{https://piazza.com/gatech/spring2026/cs3210/home}).
+
+\subsection{Supervised Labs}
+
+There is no supervised lab quiz in Week 0. Starting from Week 1, supervised lab quizzes are due \emph{Tuesday at 11:59 PM}---the same day as the supervised lab itself. Students in Section A01 should note their correct subsection assignment: last names A--L attend subsection A02, and last names M--Z attend subsection A04.
+
+\subsection{Repository Access}
+
+The course xv6 repository can be cloned with:
+
+\begin{lstlisting}[language=bash, caption={Cloning the xv6 course repository}]
+git clone git@github.gatech.edu:cs3210-spring2026/xv6.git
+\end{lstlisting}
+
+The recommended reading for this lecture is the xv6 book, Appendices A and B, which cover the x86 hardware and the PC bootstrap sequence respectively.
+
+% ============================================================
+\section{Today's Lecture: A Tour of xv6's Core Subsystems}
+% ============================================================
+
+The body of this lecture is a guided \emph{high-level tour} of the five major kernel subsystems in xv6. The goal is not to achieve deep understanding of every subsystem immediately---that comes later in the course---but to build a mental map of the codebase so that Lab 0 and Lab 1 feel navigable rather than overwhelming.
+
+The five subsystems surveyed are:
+
+\begin{enumerate}
+    \item \textbf{Bootup} --- How does a powered-off machine eventually execute C code?
+    \item \textbf{Virtual Memory} --- How does xv6 bootstrap memory management in an OS that must manage memory to manage memory?
+    \item \textbf{Processes} --- How does xv6 organize and isolate user-level execution?
+    \item \textbf{System Calls and Traps} --- How do user processes request kernel services, and how does the hardware transfer control safely?
+    \item \textbf{Filesystem} --- How does xv6 provide named, persistent storage?
+\end{enumerate}
+
+Each subsystem is examined by pointing directly at xv6 source files, which is the approach students will need to apply independently when reading the kernel for labs.
+
+% ============================================================
+\section{Booting: Getting from Power-On to C Code}
+% ============================================================
+
+\subsection{Why Booting Is Non-Trivial}
+
+A natural first question is: why can't we simply jump straight into \texttt{main()} when power is applied? The answer is that when the CPU first starts executing, almost nothing is set up. There is no stack (C code requires one), no virtual memory (so we cannot use virtual addresses), no initialized hardware, and the kernel binary has not even been loaded into RAM yet. The CPU begins executing from a small, fixed piece of firmware baked into ROM---not from the kernel binary on disk. Getting from that initial hardware state to a running kernel requires a carefully sequenced chain of initialization steps, each of which prepares the environment for the next.
+
+\subsection{The Three-Stage Boot Chain}
+
+The booting process proceeds through three distinct stages:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Stage} & \textbf{Location} & \textbf{Primary Responsibility} \\
+\midrule
+BIOS & ROM firmware (flash chip on motherboard) & Initialize lowest-level hardware; load boot block \\
+Bootloader & First block(s) of the boot disk & Set up processor; load and jump to kernel \\
+Kernel & Beginning of kernel partition in RAM & Execute as the actual running OS \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This chain is a classic example of the \emph{bootstrap problem}: to do anything useful, you need something already working. Each stage is simpler than the next and only needs to be correct enough to hand off to a slightly more capable successor.
+
+\subsection{The BIOS: Basic I/O System}
+
+The word \textbf{BIOS} comes from the Greek \textit{bios} (meaning ``life'')---the BIOS literally brings the machine to life. It is firmware stored in a dedicated flash chip on the motherboard. On a classic PC, the physical path from the CPU to the BIOS chip runs through the \textbf{northbridge} (the memory controller hub, which handles high-bandwidth traffic: CPU, RAM, and PCIe graphics) and then down through the \textbf{southbridge} (the I/O controller hub, which handles slower peripherals: USB, IDE, SATA, audio, and the LPC bus). The BIOS flash ROM is attached to the southbridge via the LPC bus.
+
+The BIOS has two primary responsibilities:
+
+\begin{enumerate}
+    \item \textbf{Initialize the memory controller.} The memory controller is a separate chip (historically part of the northbridge) that manages data flow between the CPU and DRAM. It contains multiplexer/demultiplexer circuitry to interpret physical addresses and activate the correct memory lanes and data bus lines. Without the memory controller being properly initialized, the CPU cannot read or write RAM at all. The BIOS also zero-initializes RAM---a security practice, because leftover data from a previous boot or a previous owner could otherwise leak sensitive information into new programs.
+
+    \item \textbf{Load the boot block.} After hardware initialization, the BIOS reads the \textbf{Master Boot Record (MBR)}---sector 0 (the very first 512-byte sector) of the designated boot device---into physical memory at address \texttt{0x7c00} and jumps to it. The MBR is the bootloader.
+\end{enumerate}
+
+\subsubsection*{A Note on UEFI and GPT}
+
+Most modern computers have replaced the legacy BIOS with \textbf{UEFI} (Unified Extensible Firmware Interface) and replaced the MBR partition scheme with \textbf{GPT} (GUID Partition Table). GPT allows disks larger than 2 TiB (the MBR limit), more than four primary partitions, and greater resilience to corruption by storing multiple copies of partition metadata. In this course we use the classic BIOS/MBR boot model because xv6 targets the x86 PC architecture and uses a single-block MBR bootloader.
+
+\subsection{The Bootloader: \texttt{bootasm.S} and \texttt{bootmain.c}}
+
+A popular real-world bootloader is \textbf{GRUB} (Grand Unified Bootloader), which is sophisticated enough to present multi-OS selection menus and support dozens of file systems. xv6 uses a much simpler purpose-built bootloader, split across two files in the \texttt{bootblock/} directory:
+
+\begin{itemize}
+    \item \texttt{bootasm.S} --- assembly that runs first, immediately after the BIOS jumps to \texttt{0x7c00}.
+    \item \texttt{bootmain.c} --- C code that parses the kernel ELF binary and loads it into memory.
+\end{itemize}
+
+The one-sentence summary of what the xv6 bootblock does is: \emph{prepare the CPU and memory to launch the kernel}.
+
+\subsubsection*{From Real Mode to Protected Mode}
+
+When the BIOS hands control to the bootloader, the CPU is in \textbf{real mode}: a legacy 16-bit mode dating back to the original 8086, which can only address 1~MiB of memory and provides no memory protection or privilege levels. Before the kernel can run, the bootloader must switch the CPU to \textbf{protected mode}: the 32-bit flat memory model used by modern x86 kernels that enables the full 4~GiB address space and hardware-enforced memory protection.
+
+This transition requires loading the \textbf{Global Descriptor Table (GDT)}---a data structure that tells the CPU the layout and access rights of memory segments. In \texttt{bootasm.S} at approximately line 42, the code:
+\begin{enumerate}
+    \item Defines a minimal bootstrap GDT with a null segment, a code segment covering all of physical memory (\texttt{0x0} to \texttt{0xffffffff}), and a data segment similarly spanning all of physical memory.
+    \item Executes \texttt{lgdt gdtdesc} to load the GDT register.
+    \item Sets the PE bit in control register \texttt{\%cr0} (\texttt{movl \%cr0, \%eax} / \texttt{orl \$CR0\_PE, \%eax} / \texttt{movl \%eax, \%cr0}) to activate protected mode.
+\end{enumerate}
+
+After this sequence, the CPU is in 32-bit protected mode and the bootloader can use 32-bit instructions and addresses.
+
+\subsubsection*{Loading the Kernel ELF Binary (\texttt{bootmain.c})}
+
+The kernel is stored on disk as an \textbf{ELF binary} (Executable and Linkable Format), the standard binary format on Unix-like systems. \texttt{bootmain.c} reads the ELF headers from disk, validates them, and copies each loadable program segment to the correct physical address. The xv6 kernel is linked to load at physical address \texttt{0x100000} (1~MiB), above the first megabyte of memory that is reserved for legacy hardware and BIOS structures.
+
+Once the entire kernel binary is in memory, \texttt{bootmain.c} extracts the kernel's ELF entry point and jumps to it---\emph{never to return}:
+
+\begin{lstlisting}[language=C, caption={bootmain.c:47 --- jumping into the kernel}]
+// Call the entry point from the ELF header.
+// Does not return!
+entry = (void(*)(void))(elf->entry);
+entry();
+\end{lstlisting}
+
+This unconditional transfer means the bootloader ceases to exist as a software entity at this point; the kernel owns the machine from here on. A general-purpose multiboot loader like GRUB cannot hardcode the kernel format this way, because it must support multiple kernel types. xv6's simplicity allows this shortcut.
+
+% ============================================================
+\section{Kernel Entry Point: \texttt{entry.S} and \texttt{main.c}}
+% ============================================================
+
+\subsection{Why the Kernel Cannot Jump Straight to \texttt{main()}}
+
+When the bootloader transfers control to the kernel's ELF entry point (located in \texttt{kernel/src/asm/entry.S}), the situation is still not ready for C code. Specifically, two things must be established before any C function can execute:
+
+\begin{enumerate}
+    \item \textbf{A stack.} C function calls, local variables, and function arguments are all allocated on the call stack. Without a properly initialized stack pointer (\texttt{\%esp}), the very first C function call would overwrite arbitrary memory.
+    \item \textbf{A page table (virtual memory).} The kernel is linked at virtual addresses starting around \texttt{0x80000000} (2~GiB), but at the moment of entry it is physically sitting at \texttt{0x100000} (1~MiB). Without a page table that maps virtual addresses to their actual physical locations, any memory reference using a high virtual address would fail.
+\end{enumerate}
+
+\texttt{entry.S} addresses both problems:
+\begin{enumerate}
+    \item It sets up an \emph{initial stack} pointing into a small region of BSS memory reserved at link time.
+    \item It sets up an \emph{initial page table} (the \texttt{entrypgdir}) that identity-maps the low megabytes of physical memory and also maps the high kernel virtual address range \texttt{0x80000000}--\texttt{0x80400000} to physical addresses \texttt{0x0}--\texttt{0x400000}. With this mapping in place, the kernel's high-address code and data references resolve correctly.
+    \item It jumps to \texttt{main()}, which is the normal C entry point.
+\end{enumerate}
+
+\subsection{\texttt{kernel/src/main.c}: The Kernel Startup Sequence}
+
+\texttt{main.c} is the orchestrator: it calls every subsystem initialization function in the correct order to bring the full kernel up and start running user programs. The sequence involves hardware initialization (interrupt controllers, multiprocessor configuration, device drivers) as well as subsystem initialization (memory allocator, virtual memory manager, process table, filesystem). At the very end of \texttt{main.c}, after all kernel infrastructure is ready, it calls \texttt{userinit()} to create the first user-space process.
+
+% ============================================================
+\section{Kernel Subsystem: Virtual Memory}
+% ============================================================
+
+\subsection{The Core Problem: Physical vs.\ Virtual Addresses}
+
+Modern operating systems almost never work with raw physical memory addresses when addressing user code, stack, or heap. Instead, \emph{every} process (and the kernel itself) operates in a \textbf{virtual address space}---an abstraction in which each entity appears to have exclusive access to the full range of addressable memory. In reality, of course, each process only has access to whatever subset of physical DRAM has been allocated to it. The mechanism that makes this illusion work is the \textbf{paging subsystem}: the hardware Memory Management Unit (MMU), directed by kernel-maintained data structures called \textbf{page tables}, transparently translates virtual addresses to physical addresses on every memory access.
+
+This abstraction provides isolation (one process cannot accidentally reference another's physical pages), simplifies program loading (every program can be compiled to use the same virtual address layout), and enables powerful OS features such as demand paging and copy-on-write fork.
+
+\subsection{Page Tables: Mapping Virtual to Physical}
+
+A page table is a hierarchical data structure that encodes a mapping from \emph{virtual page numbers} to \emph{physical page numbers}, along with permission flags (read, write, execute, user-accessible). The x86 hardware walks this table automatically whenever the CPU generates a memory address. The base address of the current page table is kept in \textbf{control register 3} (\texttt{cr3}); when the OS wants to switch between address spaces (e.g., when context-switching between processes), it simply loads a new value into \texttt{cr3}.
+
+\begin{itemize}
+    \item \textbf{32-bit OSes} (like xv6) use \emph{two-level paging}: a page directory (1024 entries of 4~bytes each = 4~KiB) points to up to 1024 page tables, each of which maps 1024 pages of 4~KiB. Together they can map $2^{32}$ = 4~GiB of virtual address space.
+    \item \textbf{64-bit OSes} (like modern Linux) use \emph{four-level paging} to cover the much larger 64-bit virtual address space.
+\end{itemize}
+
+\subsection{The Kernel Address Trick: Physical-to-Virtual Offset}
+
+There is a chicken-and-egg challenge in OS memory management: the kernel needs virtual memory to manage memory, but to set up virtual memory it needs to already be running and able to access memory. xv6 solves this with a simple but important convention: all physical addresses are made accessible to the kernel by adding a fixed offset of \texttt{0x80000000}.
+
+Concretely, \textbf{physical address} \texttt{0x100000} is accessible as \textbf{virtual address} \texttt{0x80100000} from within the kernel. This high-memory mapping is set up in \texttt{entry.S}'s initial page table and maintained permanently throughout the life of the kernel. The practical effect is that the kernel can access any physical memory location by adding \texttt{0x80000000} to the physical address.
+
+This has a direct implication for the 32-bit address space. Since the upper half (addresses $\geq$ \texttt{0x80000000}) is permanently reserved for the kernel, user processes can only directly use the \emph{lower 2~GiB} of the 4~GiB 32-bit address space.
+
+\subsection{Virtual Memory in the xv6 Source: \texttt{vm.c}}
+
+xv6 implements its virtual memory subsystem in \texttt{kernel/src/vm.c}. The minimum set of operations a VM system must provide are: allocate new page tables, map virtual pages to physical frames, switch between address spaces, and tear down address spaces. In xv6, these correspond to:
+
+\begin{itemize}
+    \item \texttt{inituvm} --- Initializes a user VM address space (for the very first process).
+    \item \texttt{allocuvm} / \texttt{deallocuvm} --- Grow or shrink a user address space by mapping or unmapping pages.
+    \item \texttt{switchuvm} --- Load a process's page table into \texttt{cr3}, switching the active address space.
+    \item \texttt{freevm} --- Tear down an address space entirely (called on process exit).
+\end{itemize}
+
+The kernel's own page table is initialized at startup via \texttt{kvmalloc()}, which calls \texttt{switchkvm()} to build the kernel page table and activate it. This kernel page table maps the kernel's virtual address range (e.g., VA \texttt{0x80100000}) down to the corresponding physical address (e.g., PA \texttt{0x100000}).
+
+\subsection{Kernel Mapping in Every User Page Table}
+
+A subtle but important design choice in xv6 is that every user process's page table \emph{contains a copy of the kernel's page table mappings} in the upper half of the address space, protected against user-mode access. This means that when a system call or interrupt causes a transition to kernel mode, the kernel's code and data are already mapped and accessible---the OS does not need to switch page tables on every kernel entry. This optimization avoids the cost of flushing the TLB (Translation Lookaside Buffer, the hardware cache of recent page table entries) on every user-to-kernel and kernel-to-user transition.
+
+% ============================================================
+\section{Kernel Subsystem: Processes}
+% ============================================================
+
+\subsection{What is a Process?}
+
+A \textbf{process} is the fundamental unit of isolation and execution in xv6 (and in all Unix-like operating systems). Conceptually, a process is a running program: it has its own virtual address space, its own set of open file descriptors, and its own CPU register state. Each process runs at a lower privilege level than the kernel (user mode, also called ring 3 on x86), which means it cannot execute privileged instructions, cannot access the kernel's memory, and cannot directly manipulate hardware.
+
+The process-related code lives in \texttt{kernel/src/proc.c}.
+
+\subsection{Creating the First Process: \texttt{userinit} and \texttt{initcode.S}}
+
+After all kernel subsystems are initialized, \texttt{main.c} calls \texttt{userinit()} to create the very first user-space process. This first process is special because there is no pre-existing user program on disk that the kernel can simply execute yet---the kernel has no open file system connection at that point. Instead, xv6 uses a clever trick: a small piece of assembly code called \texttt{initcode.S} is \emph{linked directly into the kernel binary}. \texttt{userinit()} sets up a process whose memory is pre-populated with the bytes of \texttt{initcode.S}.
+
+What does \texttt{initcode.S} do? Its sole purpose is to invoke the \texttt{exec} system call to replace itself with the real \texttt{/init} program:
+
+\begin{lstlisting}[language={[x86masm]Assembler}, caption={initcode.S --- the first user-space code ever executed}]
+# exec(init, argv)
+.globl start
+start:
+  pushl $argv
+  pushl $init
+  pushl $0        // where caller pc would be
+  movl  $SYS_exec, %eax
+  int   $T_SYSCALL
+
+# for(;;) exit();
+exit:
+  movl $SYS_exit, %eax
+  int  $T_SYSCALL
+  jmp  exit
+
+# char init[] = "/init\0";
+init:
+  .string "/init\0"
+
+# char *argv[] = { init, 0 };
+.p2align 2
+argv:
+  .long init
+  .long 0
+\end{lstlisting}
+
+The assembly pushes the path \texttt{"/init"} and its argument vector onto the stack and then triggers the system call interrupt (\texttt{int \$T\_SYSCALL}) with the syscall number for \texttt{exec} in \texttt{\%eax}. If \texttt{exec} fails for any reason, the code falls through into an infinite loop calling \texttt{exit}.
+
+\subsection{The \texttt{/init} Program and the Shell}
+
+The \texttt{/init} program (\texttt{user/src/init.c}) is a user-space C program. It sets up the console as file descriptors 0, 1, and 2 (standard input, standard output, and standard error) and then starts the shell. From this point forward, the system behaves like a traditional Unix machine: the shell prompts for commands, the user types them, and the shell calls \texttt{fork} and \texttt{exec} to run programs.
+
+\subsection{Symmetric Multiprocessing and Scheduling}
+
+xv6 supports \textbf{Symmetric Multiprocessing (SMP)}: multiple CPU cores that share the same physical memory and can all run processes simultaneously. The relevant functions in \texttt{proc.c} are:
+
+\begin{itemize}
+    \item \texttt{scheduler()} --- The per-CPU scheduling loop. Each CPU core runs an infinite loop that picks the next runnable process from the process table and switches to it.
+    \item \texttt{sched()} --- Called by a running process when it wants to give up the CPU (e.g., when blocking on I/O). It switches from the process's context back to the scheduler.
+    \item \texttt{swtch()} (in \texttt{swtch.S}) --- The low-level context-switch primitive. It saves the current set of callee-saved registers (\texttt{\%ebp}, \texttt{\%ebx}, \texttt{\%esi}, \texttt{\%edi}, and \texttt{\%esp}) into a \texttt{context} struct and restores the registers of the target context. This is what makes it appear as though a different thread of execution is running.
+    \item \texttt{yield()} --- A convenience function by which a process voluntarily releases the CPU.
+\end{itemize}
+
+For interprocess communication and synchronization, \texttt{proc.c} also provides \texttt{sleep()} and \texttt{wakeup()}, which allow a process to block waiting for an event and be awakened when that event occurs.
+
+% ============================================================
+\section{Kernel Subsystem: System Calls and Traps}
+% ============================================================
+
+\subsection{The Fundamental Problem: Crossing the Privilege Boundary}
+
+User processes run in an unprivileged mode. The kernel---and only the kernel---can perform privileged operations: writing to hardware ports, modifying page tables, managing interrupts, and so on. When a user process needs a service that requires privilege (reading a file, creating a new process, allocating memory), it must ask the kernel to perform the operation on its behalf. This is the role of a \textbf{system call}.
+
+The hardware mechanism that makes this crossing safe is the \textbf{trap}: a synchronous, controlled transfer of execution from user mode to a specific, kernel-designated handler, at a privilege level upgrade. The CPU automatically switches to the kernel stack, saves the user-mode register state, and jumps to the handler address specified in the \textbf{Interrupt Descriptor Table (IDT)}. The IDT is a kernel-controlled table that maps \emph{trap vectors} (small integers) to handler addresses; because the kernel controls this table, user code cannot redirect trap handling to an arbitrary address.
+
+\subsection{The Trap Infrastructure in xv6}
+
+The trap system in xv6 involves several files that collaborate:
+
+\begin{itemize}
+    \item \textbf{\texttt{vector.S}} --- Contains the complete list of trap entry points, one for each trap vector. All possible transitions from user space to kernel space---as well as kernel-to-kernel transitions, hardware interrupts, exceptions, and faults---are enumerated here. Each entry stubs in the vector number and jumps to a common handler.
+    \item \textbf{\texttt{trapasm.S}} --- The common trap entry stub. After the per-vector entry point pushes the vector number, \texttt{trapasm.S} takes over: it saves the rest of the user-mode register state onto the kernel stack (forming a \textbf{trap frame}), sets up the segment registers for kernel use, and calls the C \texttt{trap()} function.
+    \item \textbf{\texttt{trap.c}} --- The main trap dispatcher (line 37 contains the central \texttt{trap()} function). It examines the trap vector and dispatches to the appropriate handler. Crucially, it also handles hardware interrupts by routing them to device-specific interrupt handlers.
+\end{itemize}
+
+\subsubsection*{The Trap Frame}
+
+A \textbf{trap frame} is a C structure that holds a complete snapshot of the user-mode register state at the moment the trap occurred: all general-purpose registers, the instruction pointer, code segment, flags register, and (for transitions from user to kernel mode) the user-mode stack pointer and stack segment. This snapshot is essential both for the kernel to know the context from which the trap originated and for eventually returning to user mode---the CPU's \texttt{iret} instruction restores the processor state from the trap frame to resume execution where it left off.
+
+\subsubsection*{The Interrupt Descriptor Table}
+
+\texttt{tvinit()} in \texttt{trap.c} initializes the IDT by calling \texttt{SETGATE} for each entry, pointing each vector to its corresponding entry in \texttt{vector.S}. Once set up, \texttt{lidt()} loads the IDT register so the CPU knows where to find it. From this point, every trap---whether a page fault, a divide-by-zero, a hardware interrupt, or a deliberate system call---routes through the IDT.
+
+\subsection{System Calls: Vector 64}
+
+The most important trap vector for everyday operation is \textbf{vector 64} (\texttt{0x40}), which is the \emph{system call} vector. When a user-space program executes \texttt{int \$T\_SYSCALL} (where \texttt{T\_SYSCALL} = 64), the CPU traps, the IDT routes execution through \texttt{vector.S} and \texttt{trapasm.S} into \texttt{trap()}, which recognizes vector 64 and calls \texttt{syscall()} from \texttt{syscall.c}.
+
+\texttt{syscall.c} maintains a \emph{dispatch table}: an array indexed by system call number that maps each number to the corresponding kernel function that implements it. The system call number is passed by the user process in register \texttt{\%eax}. For example, when \texttt{initcode.S} places \texttt{SYS\_exec} in \texttt{\%eax} and executes \texttt{int \$T\_SYSCALL}, the kernel eventually calls the \texttt{sys\_exec()} function.
+
+Individual system call implementations are spread throughout the codebase according to what they operate on. For instance, \texttt{sys\_pipe} (the system call to create a pipe) lives in \texttt{sysfile.c} alongside other file-related system calls, rather than in \texttt{syscall.c} itself. This modular organization keeps each subsystem's kernel logic colocated with the system calls that use it.
+
+% ============================================================
+\section{Kernel Subsystem: Filesystem}
+% ============================================================
+
+\subsection{Purpose and Design Goals}
+
+The filesystem is the OS abstraction that provides \emph{naming} and \emph{persistence}: it allows data to be stored under human-meaningful names and to survive beyond the lifetime of any individual process or even across system reboots. Without a filesystem, every program would need to manage raw disk sectors directly---an obviously untenable state of affairs.
+
+xv6's filesystem is intentionally simple. It supports regular files and directories, hard links, and a Unix-style hierarchical namespace rooted at \texttt{/}. It does not support permissions, soft links, or advanced features like journaling-level atomicity (though it does have a basic log for crash recovery).
+
+\subsection{Block Layer: \texttt{bio.c}}
+
+At the lowest level of the filesystem stack is the \textbf{buffer cache} implemented in \texttt{bio.c}. The buffer cache sits between the filesystem logic and the raw disk driver. Its purposes are:
+
+\begin{enumerate}
+    \item \textbf{Caching}: It keeps recently used disk blocks in memory so that repeated reads avoid slow disk I/O.
+    \item \textbf{Synchronization}: It ensures that only one kernel thread has a writable reference to a given block at a time, preventing concurrent modifications.
+    \item \textbf{Write-back}: Dirty blocks (blocks that have been modified in memory but not yet written to disk) are eventually written back asynchronously.
+\end{enumerate}
+
+\texttt{bio.c} provides \texttt{bread()} (read a block, returning a cached copy) and \texttt{bwrite()} (write a modified block back to disk).
+
+\subsection{Logging Layer: \texttt{log.c}}
+
+One disk block away from a crash-consistent filesystem is the \textbf{log} implemented in \texttt{log.c}. The log ensures \emph{filesystem consistency}: if the machine crashes in the middle of a multi-block operation (e.g., creating a file requires writing the directory, the inode, and the data block), the log allows the operation to be either fully completed or fully rolled back on the next boot. Without a log, a partial write could leave the filesystem in a corrupted, inconsistent state.
+
+The log works by writing all blocks involved in a transaction to a reserved \emph{log area} on disk first, then marking the transaction as committed, then copying the log blocks to their final locations. On reboot, if an incomplete transaction is found, it is simply discarded; if a committed but not yet applied transaction is found, it is replayed.
+
+\subsection{Inode Layer: \texttt{fs.c}}
+
+\texttt{fs.c} implements the \textbf{inode} layer. An \textbf{inode} (index node) is the fundamental metadata structure for a file: it stores the file's type (regular file or directory), size, reference count (number of directory entries pointing to it---this is the mechanism for hard links), and pointers to the data blocks that hold the file's content.
+
+Key inode operations in \texttt{fs.c}:
+
+\begin{itemize}
+    \item \texttt{ialloc} --- Allocate a new inode on disk.
+    \item \texttt{iupdate} --- Write an in-memory inode's modified metadata back to disk.
+    \item \texttt{iget} --- Retrieve an inode by number, either from the in-memory inode cache or from disk (caching it if not already present).
+    \item \texttt{iput} --- Release a reference to an inode; if the reference count drops to zero and no directory entries point to it, the inode and its data blocks are freed.
+\end{itemize}
+
+Block allocation and freeing at the raw block level is handled by \texttt{balloc()} and \texttt{bfree()} in \texttt{fs.c}. xv6 uses a \emph{bitmap} on disk to track which blocks are free; \texttt{balloc} scans the bitmap to find a free block, and \texttt{bfree} clears the corresponding bit. Blocks are typically 8 sectors = 4~KiB in size.
+
+\subsection{System Call Layer: \texttt{sysfile.c}}
+
+Above the inode layer, \texttt{sysfile.c} provides the system call implementations that user processes invoke to interact with the filesystem. These include creating files, creating directories, executing programs (\texttt{sys\_exec}), and creating pipes. A \textbf{pipe} is a file-like object that provides a unidirectional byte stream between two processes---it is the backbone of Unix shell pipelines and is implemented here alongside other file-related system calls because it shares the same file-descriptor abstraction.
+
+\subsection{The Filesystem as a Layered Stack}
+
+It is worth stepping back to appreciate how the filesystem is organized as a layered stack, with each layer hiding complexity from the layers above it:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Layer} & \textbf{Abstraction Provided} \\
+\midrule
+\texttt{sysfile.c} & System calls: files, directories, pipes visible to user code \\
+\texttt{fs.c} (inode layer) & Named, typed files with metadata and hard links \\
+\texttt{log.c} & Crash-consistent atomic multi-block transactions \\
+\texttt{bio.c} (buffer cache) & Cached, synchronized access to disk blocks \\
+Disk driver & Raw sector reads/writes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each layer is a narrow interface that hides the implementation details of everything below it---precisely the abstraction principle that Lecture 1 identified as the central organizing idea of all OS design.
+
+% ============================================================
+\section{Summary}
+% ============================================================
+
+\begin{itemize}
+    \item \textbf{Boot chain}: Power-on triggers the BIOS (in ROM), which initializes hardware and loads the bootloader from the MBR; the bootloader switches the CPU from real mode to 32-bit protected mode, loads the kernel ELF binary to physical address \texttt{0x100000}, and jumps to the kernel entry point.
+    \item \textbf{Kernel entry}: Before calling \texttt{main()}, \texttt{entry.S} sets up an initial stack and initial page table, because C code requires both.
+    \item \textbf{Virtual memory}: xv6 uses page tables (managed in \texttt{vm.c}) to give each process an independent virtual address space; the kernel maps all physical addresses at a fixed \texttt{0x80000000} offset; \texttt{cr3} holds the active page-table base address.
+    \item \textbf{Kernel page table in every user process}: Every user page table embeds the kernel's mappings in the upper 2~GiB, eliminating the need to switch page tables on system call entry and exit.
+    \item \textbf{Processes}: The first process is created by \texttt{userinit()} using \texttt{initcode.S}, which immediately execs \texttt{/init}, which starts the shell; subsequent processes are created by \texttt{fork}/\texttt{exec}; scheduling uses \texttt{swtch()} to save and restore CPU context.
+    \item \textbf{Traps and system calls}: Every user-to-kernel transition is a trap; the IDT (initialized by \texttt{tvinit}) maps trap vectors to handlers; vector 64 is the system call; the trap frame saves all user register state; \texttt{syscall.c} dispatches based on the call number in \texttt{\%eax}.
+    \item \textbf{Filesystem layers}: The filesystem stack consists of \texttt{bio.c} (block cache), \texttt{log.c} (crash recovery), \texttt{fs.c} (inode management), and \texttt{sysfile.c} (user-visible system calls).
+    \item \textbf{xv6 as a complete but simple OS}: All five subsystems together provide memory management, process isolation, user interaction, event handling, and persistent storage---the full set of services a basic OS must provide. xv6 lacks many modern features but is complete enough to be the subject of substantial lab work throughout the semester.
+\end{itemize}
+
+% ============================================================
+\section{References}
+% ============================================================
+
+\begin{itemize}
+    \item Tumanov, A. \textit{CS3210: Design of Operating Systems --- Lecture 2 Slides: xv6: A Short Intro to a Small OS}. Georgia Institute of Technology. January 15, 2026.
+    \item Cox, R.; Kaashoek, F.; Morris, R. \textit{xv6: a simple, Unix-like teaching operating system}. MIT CSAIL. \url{https://pdos.csail.mit.edu/6.828/2022/xv6.html}
+    \item Cox, R.; Kaashoek, F.; Morris, R. \textit{xv6 Book, Appendix A: PC Hardware} and \textit{Appendix B: The Boot Loader}. MIT CSAIL.
+    \item Silberschatz, A.; Galvin, P.\ B.; Gagne, G. \textit{Operating System Concepts}. 10th ed.\ John Wiley \& Sons. 2018. (Chapter 9: Virtual Memory; Chapter 13: File System Interface.)
+\end{itemize}
+
+% ============================================================
+\section*{Personal Notes}
+% ============================================================
+% Add your own notes below this line
+
+\end{document}

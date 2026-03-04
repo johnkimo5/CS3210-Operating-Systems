@@ -1,0 +1,575 @@
+% ============================================================
+%  xv6 RISC-V — Chapter 5: Interrupts and Device Drivers
+%  Study Notes
+% ============================================================
+\documentclass[11pt, a4paper]{article}
+
+% --- Packages -----------------------------------------------
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+\usepackage{tcolorbox}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit, backgrounds}
+\tcbuselibrary{skins, breakable}
+
+% --- Colours ------------------------------------------------
+\definecolor{hardwarebg}{RGB}{230, 240, 255}
+\definecolor{kernelbg}{RGB}{230, 255, 235}
+\definecolor{summarybg}{RGB}{255, 252, 220}
+\definecolor{conceptbg}{RGB}{245, 235, 255}
+\definecolor{implbg}{RGB}{245, 245, 245}
+\definecolor{tophalf}{RGB}{255, 240, 225}
+\definecolor{bottomhalf}{RGB}{225, 245, 255}
+\definecolor{codegray}{RGB}{248, 248, 248}
+\definecolor{codeframe}{RGB}{180, 180, 180}
+\definecolor{keycolor}{RGB}{0, 80, 160}
+\definecolor{dangercolor}{RGB}{160, 30, 30}
+\definecolor{timercolor}{RGB}{30, 100, 30}
+
+% --- Listings -----------------------------------------------
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  keepspaces=true,
+  columns=fullflexible,
+  showstringspaces=false
+}
+
+% --- tcolorbox styles ---------------------------------------
+\tcbset{
+  hardware/.style={
+    colback=hardwarebg, colframe=blue!50!black,
+    fonttitle=\bfseries\sffamily, title={Hardware Responsibilities},
+    breakable, enhanced
+  },
+  kernel/.style={
+    colback=kernelbg, colframe=green!40!black,
+    fonttitle=\bfseries\sffamily, title={Kernel / Driver Responsibilities},
+    breakable, enhanced
+  },
+  summary/.style={
+    colback=summarybg, colframe=orange!60!black,
+    fonttitle=\bfseries\sffamily,
+    breakable, enhanced
+  },
+  foundational/.style={
+    colback=conceptbg, colframe=violet!60!black,
+    fonttitle=\bfseries\sffamily, title={Foundational Concept},
+    breakable, enhanced
+  },
+  impldetail/.style={
+    colback=implbg, colframe=gray!60,
+    fonttitle=\bfseries\sffamily, title={Implementation Detail},
+    breakable, enhanced
+  },
+  lifecycle/.style={
+    colback=white, colframe=dangercolor,
+    fonttitle=\bfseries\sffamily\color{dangercolor},
+    breakable, enhanced, boxrule=1pt
+  },
+  tophalf/.style={
+    colback=tophalf, colframe=orange!70!black,
+    fonttitle=\bfseries\sffamily, title={Top Half (Process Context)},
+    breakable, enhanced
+  },
+  bottomhalf/.style={
+    colback=bottomhalf, colframe=blue!60!black,
+    fonttitle=\bfseries\sffamily, title={Bottom Half (Interrupt Context)},
+    breakable, enhanced
+  },
+  timer/.style={
+    colback=timercolor!8, colframe=timercolor,
+    fonttitle=\bfseries\sffamily,
+    breakable, enhanced
+  },
+  warning/.style={
+    colback=red!5, colframe=red!60!black,
+    fonttitle=\bfseries\sffamily,
+    breakable, enhanced
+  }
+}
+
+% --- Section formatting -------------------------------------
+\titleformat{\section}{\large\bfseries\sffamily\color{keycolor}}{\thesection}{0.8em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries\sffamily}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalsize\itshape\sffamily}{\thesubsubsection}{0.5em}{}
+
+% --- Header / Footer ----------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\sffamily\small xv6 RISC-V Study Notes}
+\rhead{\sffamily\small Chapter 5: Interrupts \& Device Drivers}
+\cfoot{\thepage}
+
+% --- Document -----------------------------------------------
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries\sffamily Chapter 5: Interrupts and Device Drivers}\\[0.4em]
+  {\large\sffamily xv6 RISC-V Study Notes}\\[0.2em]
+  {\small\itshape Based on Cox, Kaashoek \& Morris --- \emph{xv6: a simple, Unix-like teaching OS} (rev.\ 3, 2022)}
+\end{center}
+
+\vspace{0.5em}\hrule\vspace{1em}
+
+% ============================================================
+\section{Big Picture: What Problem Does This Chapter Solve?}
+% ============================================================
+
+\subsection{The Core Challenge}
+
+Hardware devices operate \emph{asynchronously}: a keyboard fires an interrupt the moment a key is pressed; a disk signals completion unpredictably. The CPU cannot simply poll every device in a tight loop --- it would waste all its time checking devices that rarely have work to do.
+
+The operating system needs a principled way to:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Configure} hardware to generate interrupts at the right moments.
+  \item \textbf{Dispatch} incoming interrupts to the correct driver without losing data.
+  \item \textbf{Decouple} the slow device from the fast process so neither has to wait on the other.
+  \item \textbf{Protect} shared driver data structures from concurrent access by multiple CPUs and interrupt handlers.
+\end{itemize}
+
+Chapter 5 answers these questions using the UART console as a worked example, then generalises to timer interrupts and the broader landscape of device I/O.
+
+\subsection{What is a Driver?}
+
+A \textbf{driver} is kernel code that owns a single device. It has three jobs:
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Configure} the device hardware (memory-mapped registers, interrupt enable bits).
+  \item \textbf{Issue commands} to the device and manage I/O requests from user processes.
+  \item \textbf{Handle interrupts} that the device raises when an operation completes or new data arrives.
+\end{enumerate}
+
+Drivers are tricky because they execute \emph{concurrently with the device hardware} and must reason carefully about shared state, interrupt timing, and multiple CPUs.
+
+\subsection{The Two Halves of Every Driver}
+
+\begin{tcolorbox}[tophalf]
+\textbf{Called from a process context} (e.g., via a \lstinline|read| or \lstinline|write| system call).\\
+Starts an I/O operation (writes to device registers), then \textbf{sleeps} waiting for completion.\\
+\emph{Example: \lstinline|consoleread| waiting for a full line of input.}
+\end{tcolorbox}
+
+\vspace{0.5em}
+
+\begin{tcolorbox}[bottomhalf]
+\textbf{Called from interrupt context} (the CPU's interrupt handler fires when the device is done).\\
+Collects completed data, \textbf{wakes up} the sleeping process, and queues the next operation.\\
+\emph{Example: \lstinline|uartintr| reading a received character and calling \lstinline|consoleintr|.}
+\end{tcolorbox}
+
+\vspace{0.5em}
+
+\begin{tcolorbox}[foundational]
+\textbf{Why split into two halves?} A process cannot spin-wait in the kernel for a slow device --- that would monopolise a CPU. By sleeping in the top half and using the interrupt to signal completion, the kernel frees the CPU to run other processes while the device is busy. This is the core pattern behind all I/O concurrency.
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Drivers own devices. Every driver splits work into a \emph{top half} (starts I/O, sleeps) and a \emph{bottom half} (interrupt handler, wakes up sleeping processes). This split is what allows the CPU to remain productive while slow hardware finishes its work.
+\end{tcolorbox}
+
+% ============================================================
+\section{Core Mechanisms}
+% ============================================================
+
+\subsection{Memory-Mapped I/O (MMIO)}
+
+Hardware devices appear to software as a set of \emph{memory-mapped registers}: physical addresses that, when read or written, talk to the device rather than RAM.
+
+\begin{itemize}[leftmargin=1.5em]
+  \item The UART device in xv6 is a \textbf{16550 chip} (emulated by QEMU).
+  \item Its registers are mapped starting at physical address \lstinline|0x10000000| (\lstinline|UART0|).
+  \item Key registers: \lstinline|RHR| (receive holding register --- read incoming bytes), \lstinline|THR| (transmit holding register --- write outgoing bytes), \lstinline|LSR| (line status --- flags whether data is waiting or the transmitter is ready).
+  \item A regular load/store to these addresses interacts with the device; no special instructions are needed.
+\end{itemize}
+
+\subsection{The PLIC: Platform-Level Interrupt Controller}
+
+Multiple devices can raise interrupts. The CPU needs to know \emph{which} device interrupted.
+
+\begin{itemize}[leftmargin=1.5em]
+  \item The \textbf{PLIC} (Platform-Level Interrupt Controller) sits between all external devices and each CPU core.
+  \item When a device raises an interrupt, the PLIC holds it and signals the CPU.
+  \item \lstinline|devintr()| asks the PLIC which device interrupted (\lstinline|kernel/trap.c:187|) and dispatches to the appropriate driver interrupt handler.
+  \item After the interrupt is handled, the driver clears the interrupt at the PLIC.
+\end{itemize}
+
+\subsection{The CLINT: Core-Local Interruptor (Timer Only)}
+
+Timer interrupts use a separate mechanism from all other interrupts.
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Each RISC-V CPU core has a \textbf{CLINT} (Core-Local Interruptor) that generates periodic timer interrupts.
+  \item Timer interrupts are delivered in \textbf{machine mode} --- a more privileged level than supervisor mode (where the kernel normally runs).
+  \item Because machine-mode code runs without paging and has its own register set, xv6 handles timer interrupts in a minimal machine-mode handler (\lstinline|timervec|) that simply re-raises them as a \textbf{software interrupt} visible to supervisor mode.
+\end{itemize}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Devices expose themselves via memory-mapped registers. The PLIC arbitrates external device interrupts, telling the CPU which device fired. The CLINT handles per-CPU timer interrupts via machine mode, which xv6 bounces through as software interrupts into the normal supervisor-mode trap path.
+\end{tcolorbox}
+
+% ============================================================
+\section{Hardware vs.\ Kernel Responsibilities}
+% ============================================================
+
+\begin{tcolorbox}[hardware]
+\textbf{When a device interrupt arrives, RISC-V hardware automatically:}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.2em]
+  \item Checks \lstinline|sstatus.SIE|; if clear, defers the interrupt.
+  \item Clears \lstinline|sstatus.SIE| (disables further interrupts).
+  \item Saves \lstinline|pc| to \lstinline|sepc|.
+  \item Records current mode in \lstinline|sstatus.SPP|.
+  \item Sets \lstinline|scause| to indicate an external interrupt.
+  \item Switches to supervisor mode.
+  \item Jumps to \lstinline|stvec| (either \lstinline|kernelvec| or \lstinline|uservec| depending on context).
+\end{enumerate}
+\textbf{The UART hardware additionally:}
+\begin{itemize}[leftmargin=1.5em, itemsep=0.1em]
+  \item Puts received bytes into its internal FIFO and asserts an interrupt line to the PLIC.
+  \item Asserts an interrupt line when the transmit FIFO is ready for more data.
+\end{itemize}
+\end{tcolorbox}
+
+\vspace{0.8em}
+
+\begin{tcolorbox}[kernel]
+\textbf{The kernel (trap handler + driver) must then:}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.2em]
+  \item Save registers (via \lstinline|uservec|/\lstinline|kernelvec| as in Ch.~4).
+  \item Call \lstinline|devintr()| which queries the PLIC to identify the interrupting device.
+  \item Dispatch to the device's interrupt handler (e.g., \lstinline|uartintr()|).
+  \item Read/write the device's MMIO registers to collect data or push new data.
+  \item Signal the PLIC that the interrupt has been handled.
+  \item Wake up any sleeping process waiting on this I/O.
+  \item Re-enable interrupts (\lstinline|sstatus.SIE|) before returning.
+  \item Restore registers and execute \lstinline|sret|.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+The hardware-kernel split from Chapter 4 applies directly to device interrupts: RISC-V saves the PC, switches mode, and jumps to \lstinline|stvec|; the kernel saves all registers, identifies the device via the PLIC, runs the driver's interrupt handler, and restores everything on return.
+\end{tcolorbox}
+
+% ============================================================
+\section{Console Input: Full Lifecycle}
+% ============================================================
+
+\subsection{Setup}
+
+\lstinline|consoleinit()| (\lstinline|kernel/console.c:182|) configures the UART to generate:
+\begin{itemize}[leftmargin=1.5em]
+  \item A \textbf{receive interrupt} every time the UART receives a byte of input.
+  \item A \textbf{transmit-complete interrupt} every time the UART finishes sending a byte of output.
+\end{itemize}
+
+\begin{tcolorbox}[lifecycle, title={Console Input Lifecycle}]
+\textbf{Top half --- Process waits for input:}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.25em]
+  \item A shell process calls \lstinline|read()|; this arrives in the kernel at \lstinline|consoleread()| (\lstinline|kernel/console.c:80|).
+  \item \lstinline|consoleread| checks \lstinline|cons.buf|. If no full line is available, it calls \lstinline|sleep()| and yields the CPU.
+  \item The process is now blocked. The CPU runs other work.
+\end{enumerate}
+
+\medskip
+\textbf{Bottom half --- Key press arrives:}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.25em]
+  \setcounter{enumi}{3}
+  \item User presses a key; UART hardware places the byte in its FIFO and signals the PLIC.
+  \item RISC-V trap fires. \lstinline|devintr()| is called; it queries the PLIC and identifies the UART.
+  \item \lstinline|devintr()| calls \lstinline|uartintr()| (\lstinline|kernel/uart.c:176|).
+  \item \lstinline|uartintr()| reads all available bytes from \lstinline|RHR| and passes each to \lstinline|consoleintr()| (\lstinline|kernel/console.c:136|).
+  \item \lstinline|consoleintr()| appends each character to \lstinline|cons.buf|, handling special characters (backspace, Ctrl-U) as it goes.
+  \item When a newline arrives, \lstinline|consoleintr()| calls \lstinline|wakeup()| to wake the sleeping \lstinline|consoleread|.
+\end{enumerate}
+
+\medskip
+\textbf{Top half resumes:}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.25em]
+  \setcounter{enumi}{9}
+  \item \lstinline|consoleread| wakes up, copies the completed line from \lstinline|cons.buf| to user space, and returns to the shell.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[impldetail]
+\lstinline|uartintr()| does \emph{not} wait for characters --- it reads whatever is present in the FIFO right now and returns immediately. Future characters will trigger a new interrupt. The driver never spins on the hardware.
+\end{tcolorbox}
+
+% ============================================================
+\section{Console Output: Full Lifecycle}
+% ============================================================
+
+\begin{tcolorbox}[lifecycle, title={Console Output Lifecycle}]
+\textbf{Top half --- Process writes output:}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.25em]
+  \item A process calls \lstinline|write()| on the console; this arrives at \lstinline|uartputc()| (\lstinline|kernel/uart.c:87|).
+  \item \lstinline|uartputc()| appends the character to the circular output buffer \lstinline|uart_tx_buf|.
+  \item It calls \lstinline|uartstart()| to start transmission (if the UART is not already sending).
+  \item \lstinline|uartstart()| checks if the UART's transmit register is free; if so, it writes the first buffered byte to \lstinline|THR| and returns.
+  \item \lstinline|uartputc()| returns immediately. The process continues --- it does \emph{not} wait for the UART to finish. (The only exception: if \lstinline|uart_tx_buf| is full, the process sleeps until space is available.)
+\end{enumerate}
+
+\medskip
+\textbf{Bottom half --- UART finishes sending:}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.25em]
+  \setcounter{enumi}{5}
+  \item UART hardware finishes sending the byte and raises a \emph{transmit-complete} interrupt.
+  \item \lstinline|uartintr()| fires; it calls \lstinline|uartstart()| again.
+  \item \lstinline|uartstart()| pulls the next buffered character, writes it to \lstinline|THR|, and returns.
+  \item This repeats for each buffered character until the buffer is empty.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[foundational]
+\textbf{I/O Concurrency via Buffering:} The output buffer (\lstinline|uart_tx_buf|) decouples the process from the device. The process deposits bytes into the buffer and keeps running; the interrupt handler drains the buffer at whatever rate the UART can handle. This pattern --- a software buffer bridging a fast producer and a slow consumer --- appears throughout OS design (disk caches, network buffers, pipe buffers).
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Console input: a process sleeps on \lstinline|consoleread|, an interrupt wakes it when a line arrives. Console output: \lstinline|uartputc| buffers immediately and returns; interrupts drain the buffer asynchronously. Both patterns rely on a buffer and a sleep/wakeup pair to decouple the process from the slow device.
+\end{tcolorbox}
+
+% ============================================================
+\section{Concurrency in Drivers}
+% ============================================================
+
+\subsection{The Three Concurrency Dangers}
+
+\begin{tcolorbox}[warning, title={Three Concurrency Hazards in the Console Driver}]
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.3em]
+  \item \textbf{Two processes on different CPUs both call \lstinline|consoleread|.}
+        Both may manipulate \lstinline|cons.buf| simultaneously, corrupting its state.
+
+  \item \textbf{A CPU is inside \lstinline|consoleread| when a UART interrupt arrives on the \emph{same} CPU.}
+        The interrupt handler (\lstinline|consoleintr|) also accesses \lstinline|cons.buf|. Without a lock, the data structure is corrupted by re-entrant access.
+
+  \item \textbf{A UART interrupt arrives on a \emph{different} CPU while \lstinline|consoleread| is running.}
+        Two execution contexts on two separate cores simultaneously modify shared data.
+\end{enumerate}
+All three are guarded by the \lstinline|cons.lock| spinlock, acquired at the start of \lstinline|consoleread| and \lstinline|consoleintr|. Chapter 6 explains how these locks work.
+\end{tcolorbox}
+
+\subsection{Interrupt Handler Constraints}
+
+Interrupt handlers run in a special context with important restrictions:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item An interrupt handler \textbf{cannot know which process is currently running} --- it may fire while any (or no) process is scheduled on that CPU.
+  \item Therefore an interrupt handler \textbf{must not use the current process's page table} (e.g., it cannot safely call \lstinline|copyout| with a user address).
+  \item Interrupt handlers should do \textbf{as little work as possible} --- typically just buffer the data and wake up top-half code to do the real processing.
+\end{itemize}
+
+\begin{tcolorbox}[foundational]
+\textbf{Why interrupt handlers must be lean:} Because timer interrupts can fire at \emph{any} moment, including inside other interrupt handlers (unless SIE is cleared), and because the handler cannot safely assume anything about the currently running process, interrupt handlers must limit themselves to operations that are safe in any context: reading MMIO registers, writing to kernel buffers, and signalling sleeping processes via \lstinline|wakeup()|.
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Drivers face three concurrency threats: multi-CPU access, same-CPU re-entrant interrupt delivery, and cross-CPU interrupt delivery. All three are handled with locks. Interrupt handlers are further restricted: they must not assume a particular process context and should defer heavy work to the top half via sleep/wakeup.
+\end{tcolorbox}
+
+% ============================================================
+\section{Timer Interrupts}
+% ============================================================
+
+\subsection{Why Timer Interrupts Are Different}
+
+Timer interrupts serve a special role: they are the mechanism by which xv6 \textbf{preempts} long-running processes and switches to other threads (via \lstinline|yield()|). Without timer interrupts a CPU-bound process could monopolise a core forever.
+
+\begin{tcolorbox}[timer, title={Timer Interrupt Peculiarities}]
+\begin{itemize}[leftmargin=1.5em, itemsep=0.2em]
+  \item Timer interrupts are delivered in \textbf{machine mode} (not supervisor mode).
+  \item Machine mode has its own separate control registers (\lstinline|mtvec|, \lstinline|mscratch|, etc.) and runs without paging.
+  \item It is not practical to run normal xv6 kernel C code in machine mode.
+  \item Therefore, xv6 handles timer interrupts in a \textbf{pure-assembly machine-mode handler} (\lstinline|timervec|, \lstinline|kernel/kernelvec.S:95|) that does the minimum necessary, then re-raises the interrupt as a \textbf{software interrupt} (SSIP bit) visible in supervisor mode.
+  \item The supervisor-mode trap path then handles it via the normal \lstinline|devintr()| dispatch.
+\end{itemize}
+\end{tcolorbox}
+
+\subsection{Timer Interrupt Lifecycle}
+
+\begin{tcolorbox}[lifecycle, title={Timer Interrupt Lifecycle}]
+\textbf{Setup (once at boot, in \lstinline|start.c| before \lstinline|main|):}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.2em]
+  \item Program the \textbf{CLINT} to generate an interrupt after a fixed number of clock ticks.
+  \item Set up a per-CPU \emph{scratch area} (analogous to a machine-mode trapframe) to hold saved registers and the CLINT address.
+  \item Set \lstinline|mtvec| to \lstinline|timervec| and enable machine-mode timer interrupts.
+\end{enumerate}
+
+\medskip
+\textbf{Every timer tick:}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.2em]
+  \setcounter{enumi}{3}
+  \item CLINT fires; CPU enters machine mode at \lstinline|timervec|.
+  \item \lstinline|timervec| saves a few registers to the scratch area.
+  \item \lstinline|timervec| programs the CLINT for the \emph{next} timer interrupt.
+  \item \lstinline|timervec| sets the \textbf{SSIP} bit in \lstinline|sip| --- this requests a supervisor-mode software interrupt.
+  \item \lstinline|timervec| restores saved registers and returns from machine mode.
+  \item CPU takes the pending software interrupt in supervisor mode via the normal trap path (\lstinline|usertrap| or \lstinline|kerneltrap|).
+  \item \lstinline|devintr()| recognises it as a software interrupt and returns the timer interrupt code.
+  \item \lstinline|usertrap|/\lstinline|kerneltrap| calls \lstinline|yield()| to switch to another process.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[foundational]
+\textbf{The indirection through software interrupt:} Since timer interrupts arrive in machine mode and xv6 kernel code lives in supervisor mode, xv6 cannot simply call \lstinline|yield()| from the machine-mode handler. The machine-mode handler's only job is to schedule the next timer tick and \emph{poke} supervisor mode by raising a software interrupt. The real work (context switching) happens in the well-understood supervisor-mode trap path.
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Timer interrupts arrive in machine mode, which xv6 keeps minimal (pure asm, no C). The machine-mode handler reschedules the CLINT and re-delivers the interrupt as a supervisor-mode software interrupt. Supervisor mode then calls \lstinline|yield()| through the normal trap path to preempt the running process.
+\end{tcolorbox}
+
+% ============================================================
+\section{Foundational vs.\ Implementation Details}
+% ============================================================
+
+\subsection{Foundational Concepts (Must Understand)}
+
+\begin{tcolorbox}[foundational, title={Foundational Concepts}]
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.3em]
+  \item \textbf{The top-half / bottom-half split is the universal driver pattern.}
+        Starting I/O in a process context and completing it in an interrupt context (with a buffer and sleep/wakeup in between) is how every I/O driver in every OS works.
+
+  \item \textbf{Memory-mapped I/O is how software talks to hardware.}
+        Device registers look like ordinary memory addresses. The OS accesses devices with the same load/store instructions it uses for RAM.
+
+  \item \textbf{Buffering is what makes I/O concurrency possible.}
+        Without a buffer between the fast process and the slow device, one must wait on the other. A buffer lets both proceed at their own pace.
+
+  \item \textbf{Interrupt handlers must be context-agnostic.}
+        Because an interrupt can arrive in the middle of any process (or no process), interrupt handlers must not rely on process-specific state. They should do minimal work and delegate to sleeping top-half code.
+
+  \item \textbf{Timer interrupts are the preemption mechanism.}
+        Without periodic timer interrupts, a runaway or CPU-bound process could permanently monopolise a CPU core.
+
+  \item \textbf{Machine mode is a separate island from supervisor mode.}
+        RISC-V's three privilege levels (user, supervisor, machine) each have their own trap registers. Timer interrupts at machine mode require their own minimal handler that bounces work back to supervisor mode via software interrupts.
+\end{enumerate}
+\end{tcolorbox}
+
+\subsection{Implementation Details (Good to Know)}
+
+\begin{tcolorbox}[impldetail]
+\begin{itemize}[leftmargin=1.5em, itemsep=0.2em]
+  \item UART0 is mapped at \lstinline|0x10000000|; register offsets (RHR, THR, LSR, etc.) are defined in \lstinline|kernel/uart.c:22|.
+  \item \lstinline|consoleinit()| configures the UART for receive and transmit-complete interrupts (\lstinline|kernel/console.c:182|).
+  \item \lstinline|uart_tx_buf| is a circular buffer; \lstinline|uartputc| sleeps only when the buffer is completely full.
+  \item \lstinline|uartstart()| is called by both \lstinline|uartputc| (top half) and \lstinline|uartintr| (bottom half) to avoid duplicating the ``write next byte to THR'' logic.
+  \item \lstinline|cons.buf| is a fixed-size circular buffer; \lstinline|consoleintr| handles backspace by decrementing the write pointer.
+  \item The PLIC interrupt dispatch happens in \lstinline|devintr()| at \lstinline|kernel/trap.c:178|; it reads the PLIC claim register to get the device ID.
+  \item \lstinline|timervec| saves and restores exactly 3 registers using the scratch area prepared by \lstinline|start.c|; there is no C code involved in the machine-mode timer handler.
+  \item The SSIP bit in the \lstinline|sip| CSR is how machine-mode code requests a software interrupt in supervisor mode.
+  \item xv6 is \textbf{not} suitable for hard real-time use: interrupts are disabled in parts of the kernel, and the scheduler is simple; worst-case latency is unbounded.
+\end{itemize}
+\end{tcolorbox}
+
+% ============================================================
+\section{Real World Context}
+% ============================================================
+
+\subsection{Programmed I/O vs.\ DMA}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lp{5.5cm}p{5.5cm}@{}}
+\toprule
+& \textbf{Programmed I/O (xv6)} & \textbf{DMA (production OS)} \\
+\midrule
+How data moves & CPU reads/writes device registers one byte at a time & Device hardware writes data directly to RAM \\
+CPU involvement & High (CPU in the loop for every byte) & Low (CPU only touched for setup and completion) \\
+Suitability & Simple, slow devices (UART) & Fast devices (disk, NIC, GPU) \\
+xv6 example & UART reads \lstinline|RHR| per character & Modern disk controllers, network cards \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Interrupts vs.\ Polling}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lp{5.5cm}p{5.5cm}@{}}
+\toprule
+& \textbf{Interrupt-driven (xv6)} & \textbf{Polling} \\
+\midrule
+Mechanism & Device signals CPU when ready & CPU repeatedly checks device status register \\
+Best for & Infrequent, unpredictable events & High-throughput, low-latency devices \\
+Overhead & Context-switch cost per interrupt & Wasted CPU cycles when device is idle \\
+Hybrid & Some drivers switch modes based on load & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+xv6's UART driver uses programmed I/O (byte-at-a-time via MMIO) and interrupt-driven I/O. Production kernels use DMA for bulk data movement (the device fills RAM directly) and may switch between interrupt-driven and polling modes depending on device load. Drivers can account for more code than the core kernel in a production OS.
+\end{tcolorbox}
+
+% ============================================================
+\section{Quick Reference}
+% ============================================================
+
+\subsection{Key Functions}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}>{\ttfamily}lp{4.5cm}p{5cm}@{}}
+\toprule
+\textbf{Function} & \textbf{Half} & \textbf{Role} \\
+\midrule
+consoleinit      & Setup        & Configures UART for interrupts \\
+consoleread      & Top          & Blocks process until a line is in \lstinline|cons.buf| \\
+consoleintr      & Bottom       & Accumulates characters into \lstinline|cons.buf|; wakes reader on newline \\
+uartintr         & Bottom       & Reads from UART FIFO; calls \lstinline|consoleintr| and \lstinline|uartstart| \\
+uartputc         & Top          & Appends char to \lstinline|uart_tx_buf|; calls \lstinline|uartstart| \\
+uartstart        & Both         & Writes next buffered byte to UART THR if UART is ready \\
+devintr          & Bottom       & Queries PLIC; dispatches to UART, disk, or timer handler \\
+timervec         & Machine-mode & Reprograms CLINT; raises SSIP software interrupt \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Key Hardware Units}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}llp{7cm}@{}}
+\toprule
+\textbf{Unit} & \textbf{Address / CSR} & \textbf{Role} \\
+\midrule
+UART0 & \lstinline|0x10000000| & Serial I/O device (keyboard/display in QEMU) \\
+PLIC  & \lstinline|0x0c000000| & Routes external device interrupts to CPUs \\
+CLINT & \lstinline|0x02000000| & Generates per-CPU timer interrupts (machine mode) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Overall Chapter Summary}
+% ============================================================
+
+\begin{tcolorbox}[summary, title={Chapter 5 --- Complete Summary}]
+Chapter 5 addresses how the OS manages asynchronous hardware devices.
+
+\begin{itemize}[leftmargin=1.5em, itemsep=0.25em]
+  \item \textbf{Drivers} own devices. They are split into a \emph{top half} (process context, starts I/O, sleeps) and a \emph{bottom half} (interrupt context, completes I/O, wakes process).
+  \item \textbf{Memory-mapped I/O} is how the kernel talks to device registers --- ordinary loads and stores to special physical addresses.
+  \item \textbf{The PLIC} arbitrates which external device interrupted; \lstinline|devintr()| queries it and dispatches to the right driver.
+  \item \textbf{Console input} flows: key press $\to$ UART FIFO $\to$ PLIC $\to$ \lstinline|uartintr| $\to$ \lstinline|consoleintr| $\to$ \lstinline|cons.buf| $\to$ \lstinline|wakeup(consoleread)|.
+  \item \textbf{Console output} flows: \lstinline|uartputc| $\to$ \lstinline|uart_tx_buf| $\to$ \lstinline|uartstart| $\to$ UART THR $\to$ transmit-complete interrupt $\to$ \lstinline|uartstart| (next byte).
+  \item \textbf{Concurrency} in drivers is dangerous (three distinct hazard scenarios); locks guard shared buffers. Interrupt handlers must be context-agnostic and minimal.
+  \item \textbf{Timer interrupts} arrive in machine mode; a minimal asm handler (\lstinline|timervec|) reschedules the CLINT and bounces a software interrupt into supervisor mode, where \lstinline|yield()| is called.
+  \item Real-world kernels extend these patterns with DMA, polling, and mixed-mode strategies for high-throughput devices.
+\end{itemize}
+\end{tcolorbox}
+
+\end{document}

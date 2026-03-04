@@ -1,0 +1,477 @@
+% ============================================================
+%  xv6 RISC-V — Chapter 4: Traps and System Calls
+%  Study Notes
+% ============================================================
+\documentclass[11pt, a4paper]{article}
+
+% --- Packages -----------------------------------------------
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{mdframed}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins, breakable}
+
+% --- Colours ------------------------------------------------
+\definecolor{hardwarebg}{RGB}{230, 240, 255}
+\definecolor{kernelbg}{RGB}{230, 255, 235}
+\definecolor{summarybg}{RGB}{255, 252, 220}
+\definecolor{conceptbg}{RGB}{245, 235, 255}
+\definecolor{implbg}{RGB}{245, 245, 245}
+\definecolor{codegray}{RGB}{248, 248, 248}
+\definecolor{codeframe}{RGB}{180, 180, 180}
+\definecolor{keycolor}{RGB}{0, 80, 160}
+\definecolor{trapcolor}{RGB}{160, 30, 30}
+
+% --- Listings -----------------------------------------------
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  keepspaces=true,
+  columns=fullflexible,
+  showstringspaces=false
+}
+
+% --- tcolorbox styles ---------------------------------------
+\tcbset{
+  hardware/.style={
+    colback=hardwarebg, colframe=blue!50!black,
+    fonttitle=\bfseries\sffamily, title={Hardware Responsibilities},
+    breakable, enhanced
+  },
+  kernel/.style={
+    colback=kernelbg, colframe=green!40!black,
+    fonttitle=\bfseries\sffamily, title={Kernel Responsibilities},
+    breakable, enhanced
+  },
+  summary/.style={
+    colback=summarybg, colframe=orange!60!black,
+    fonttitle=\bfseries\sffamily,
+    breakable, enhanced
+  },
+  foundational/.style={
+    colback=conceptbg, colframe=violet!60!black,
+    fonttitle=\bfseries\sffamily, title={Foundational Concept},
+    breakable, enhanced
+  },
+  impldetail/.style={
+    colback=implbg, colframe=gray!60,
+    fonttitle=\bfseries\sffamily, title={Implementation Detail},
+    breakable, enhanced
+  },
+  lifecycle/.style={
+    colback=white, colframe=trapcolor,
+    fonttitle=\bfseries\sffamily\color{trapcolor},
+    breakable, enhanced, boxrule=1pt
+  }
+}
+
+% --- Section formatting -------------------------------------
+\titleformat{\section}{\large\bfseries\sffamily\color{keycolor}}{\thesection}{0.8em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries\sffamily}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalsize\itshape\sffamily}{\thesubsubsection}{0.5em}{}
+
+% --- Header / Footer ----------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\sffamily\small xv6 RISC-V Study Notes}
+\rhead{\sffamily\small Chapter 4: Traps \& System Calls}
+\cfoot{\thepage}
+
+% --- Document -----------------------------------------------
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries\sffamily Chapter 4: Traps and System Calls}\\[0.4em]
+  {\large\sffamily xv6 RISC-V Study Notes}\\[0.2em]
+  {\small\itshape Based on Cox, Kaashoek \& Morris --- \emph{xv6: a simple, Unix-like teaching OS} (rev.\ 3, 2022)}
+\end{center}
+
+\vspace{0.5em}
+\hrule
+\vspace{1em}
+
+% ============================================================
+\section{Big Picture: What Problem Does This Chapter Solve?}
+% ============================================================
+
+\subsection{The Core Challenge}
+
+A running user program must sometimes ask the kernel to do things it cannot do itself --- read from disk, create a process, write to a network socket.
+Equally, the hardware may need to interrupt the CPU at any moment (e.g., when a disk finishes a read).
+And occasionally a program does something illegal (divide by zero, invalid address access).
+
+\textbf{All three situations require the same solution:} the CPU must abandon what it is currently doing, transfer control to the kernel in a controlled, secure way, let the kernel handle the event, and then (usually) resume normal execution.
+
+\subsection{The Three Trap Triggers}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Trigger}   & \textbf{Example}                           & \textbf{Origin} \\
+\midrule
+System call        & \lstinline|ecall| instruction              & User program \\
+Exception          & Divide by zero, illegal address access     & User or kernel \\
+Device interrupt   & Disk completes I/O, timer fires            & Hardware device \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+xv6 uses the word \textbf{trap} as a unified term for all three.
+
+\subsection{Why Traps Must Go Through the Kernel}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{System calls:} Only the kernel has the privilege to perform protected operations.
+  \item \textbf{Interrupts:} Isolation demands that only the kernel talks to devices; the kernel then multiplexes device access across processes.
+  \item \textbf{Exceptions:} xv6 kills any user process that causes an exception (exceptions in the kernel cause a \lstinline|panic|).
+\end{itemize}
+
+\subsection{The Four Stages of Every Trap}
+
+xv6 trap handling always follows the same four-stage pipeline:
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Hardware action} --- the RISC-V CPU atomically saves minimal state and redirects the PC.
+  \item \textbf{Assembly vector} --- a short piece of assembly (the \emph{handler vector}) prepares a safe environment for C code.
+  \item \textbf{C trap handler} --- decides what kind of trap occurred and dispatches to the right service routine.
+  \item \textbf{Service routine} --- actually implements the system call, handles the interrupt, or deals with the exception.
+\end{enumerate}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Traps are the universal mechanism by which the CPU transitions from normal execution into the kernel. They are triggered by system calls, exceptions, or device interrupts. Every trap follows the same four-stage pipeline: hardware action $\to$ assembly vector $\to$ C handler $\to$ service routine.
+\end{tcolorbox}
+
+% ============================================================
+\section{Core Mechanisms Introduced}
+% ============================================================
+
+\subsection{Key Concepts at a Glance}
+
+\begin{center}
+\begin{tabular}{@{}>{\ttfamily}lp{10cm}@{}}
+\toprule
+\textbf{Mechanism}   & \textbf{Purpose} \\
+\midrule
+stvec              & Supervisor Trap VECtor register. Kernel writes the address of its trap handler here; CPU jumps to it on any trap. \\
+sepc               & Saved Exception Program Counter. RISC-V saves \lstinline|pc| here when a trap occurs. \\
+scause             & Describes the reason for the trap (a numeric code). \\
+sscratch           & Scratch register available to the trap handler before it can save user registers. \\
+sstatus            & Status register: SIE bit enables/disables device interrupts; SPP bit records whether the trap came from user or supervisor mode. \\
+sret               & Return-from-trap instruction; copies \lstinline|sepc| back to \lstinline|pc| and restores privilege mode. \\
+\midrule
+trampoline page    & A special page mapped at the same virtual address in \emph{both} user and kernel page tables, containing the user-space trap entry/exit asm (\lstinline|uservec|/\lstinline|userret|). \\
+trapframe          & Per-process kernel-allocated page (mapped in user address space) that holds the saved user registers while the kernel runs. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+The six RISC-V control registers (\lstinline|stvec|, \lstinline|sepc|, \lstinline|scause|, \lstinline|sscratch|, \lstinline|sstatus|, \lstinline|sret|) plus the software-defined trampoline page and trapframe structure form the complete infrastructure for trap handling.
+\end{tcolorbox}
+
+% ============================================================
+\section{Hardware vs.\ Kernel Responsibilities}
+% ============================================================
+
+\begin{tcolorbox}[hardware]
+\textbf{When a trap fires, the RISC-V CPU automatically does (in order):}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.15em]
+  \item If the trap is a device interrupt and \lstinline|sstatus.SIE| is clear, abort (do nothing).
+  \item Clear \lstinline|sstatus.SIE| --- disable further device interrupts.
+  \item Copy current \lstinline|pc| to \lstinline|sepc|.
+  \item Save current privilege mode in \lstinline|sstatus.SPP|.
+  \item Set \lstinline|scause| to the trap's cause code.
+  \item Switch mode to \textbf{supervisor} (kernel mode).
+  \item Copy \lstinline|stvec| $\to$ \lstinline|pc| (jump to the trap handler).
+  \item Start executing at the new \lstinline|pc|.
+\end{enumerate}
+
+\medskip
+\textbf{Crucially, the hardware does NOT:}
+\begin{itemize}[leftmargin=1.5em, itemsep=0.1em]
+  \item Switch page tables (still using whatever page table was active).
+  \item Switch to a kernel stack.
+  \item Save any general-purpose registers (only \lstinline|pc| is implicitly saved via \lstinline|sepc|).
+\end{itemize}
+The CPU deliberately does minimal work to give the kernel maximum flexibility.
+\end{tcolorbox}
+
+\vspace{0.8em}
+
+\begin{tcolorbox}[kernel]
+\textbf{The kernel must then do everything the hardware left undone:}
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.15em]
+  \item Save all 32 user general-purpose registers to the trapframe.
+  \item Switch page tables from user to kernel.
+  \item Switch to the kernel stack.
+  \item Identify the trap cause (\lstinline|scause|) and dispatch to the right handler (system call, device interrupt, or exception).
+  \item (System calls) Retrieve arguments from the trapframe, execute the service, write return value back to the trapframe.
+  \item (Interrupts) Run the device driver.
+  \item (Exceptions) Kill the offending process (user space) or panic (kernel space).
+  \item On return: restore user registers from the trapframe, switch back to user page table, execute \lstinline|sret|.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+The hardware/kernel split is intentional: RISC-V does the bare minimum (save PC, set mode, jump to handler) so the kernel retains full control over security-critical decisions like page table switching and stack selection. The kernel must save all register state, switch address spaces, and orchestrate the entire service and return path.
+\end{tcolorbox}
+
+% ============================================================
+\section{Full Trap Lifecycle: Step-by-Step}
+% ============================================================
+
+xv6 maintains \emph{separate code paths} for three cases. The following walks through each.
+
+% ---- 4.1 User-space trap -----------------------------------
+\subsection{Case 1 — Trap from User Space}
+
+\begin{tcolorbox}[lifecycle, title={User-Space Trap Lifecycle}]
+
+\textbf{Entry path:} \lstinline|uservec| (trampoline.S:21) $\to$ \lstinline|usertrap| (trap.c:37)
+
+\textbf{Exit path:} \lstinline|usertrapret| (trap.c:90) $\to$ \lstinline|userret| (trampoline.S:101)
+
+\medskip
+\textbf{Step-by-step:}
+
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.3em]
+
+  \item \textbf{[HW] Trap fires.}
+        CPU saves \lstinline|pc| $\to$ \lstinline|sepc|, sets \lstinline|scause|, switches to supervisor mode, jumps to \lstinline|stvec| (which points to the trampoline's \lstinline|uservec|).
+
+  \item \textbf{[uservec] Swap a0 / sscratch.}
+        \lstinline|uservec| uses the \lstinline|csrw| instruction to exchange \lstinline|a0| with \lstinline|sscratch|.
+        This frees one register (\lstinline|a0|) to work with. \lstinline|sscratch| had been pre-loaded (by the kernel before returning to user space) with the address of the process's \textbf{trapframe}.
+
+  \item \textbf{[uservec] Save all 32 user registers.}
+        \lstinline|uservec| loads the trapframe address into \lstinline|a0| and saves all 32 user registers (including the real \lstinline|a0| recovered from \lstinline|sscratch|) into the trapframe.
+
+  \item \textbf{[uservec] Switch page tables and jump to usertrap.}
+        The trapframe also contains the kernel page table address, kernel stack pointer, and \lstinline|usertrap|'s address. \lstinline|uservec| loads these, switches \lstinline|satp| to the kernel page table, and calls \lstinline|usertrap|.
+        (This works because the trampoline page is mapped at the \emph{same} virtual address in both page tables.)
+
+  \item \textbf{[usertrap] Redirect stvec.}
+        \lstinline|usertrap| immediately changes \lstinline|stvec| to point to \lstinline|kernelvec| so that any trap that occurs \emph{while in the kernel} is handled correctly.
+
+  \item \textbf{[usertrap] Save sepc.}
+        \lstinline|usertrap| saves \lstinline|sepc| into the trapframe (because a subsequent \lstinline|yield()| call could overwrite it).
+
+  \item \textbf{[usertrap] Dispatch on cause.}
+        \begin{itemize}[leftmargin=1.5em]
+          \item \lstinline|scause == 8| (ecall): it's a \textbf{system call} $\to$ call \lstinline|syscall()|, also add 4 to saved \lstinline|sepc| so \lstinline|sret| returns to the instruction \emph{after} \lstinline|ecall|.
+          \item Device interrupt $\to$ call \lstinline|devintr()|.
+          \item Anything else $\to$ \textbf{exception}: kill the process (\lstinline|p->killed = 1|).
+        \end{itemize}
+
+  \item \textbf{[syscall()] Retrieve arguments and dispatch.}
+        \lstinline|syscall()| reads the system call number from \lstinline|a7| in the trapframe, uses it to index the \lstinline|syscalls[]| function pointer table, calls the appropriate handler (e.g., \lstinline|sys_exec|), and stores the return value back in \lstinline|p->trapframe->a0|.
+
+  \item \textbf{[usertrap end] Check for kill/yield.}
+        Before returning, \lstinline|usertrap| checks if the process was killed or if a timer interrupt should cause a \lstinline|yield()|.
+
+  \item \textbf{[usertrapret] Prepare control registers for user re-entry.}
+        \lstinline|usertrapret| restores \lstinline|stvec| to \lstinline|uservec|, refreshes trapframe fields (kernel stack, kernel page table, \lstinline|usertrap| address), loads the saved \lstinline|sepc| back into the \lstinline|sepc| register, and calls \lstinline|userret| on the trampoline page.
+
+  \item \textbf{[userret] Switch back and restore registers.}
+        \lstinline|userret| switches \lstinline|satp| back to the user page table, restores all 32 user registers from the trapframe, and executes \lstinline|sret| to return to user space at the saved PC.
+
+\end{enumerate}
+\end{tcolorbox}
+
+\subsubsection{Why the Trampoline Page Exists}
+
+\begin{tcolorbox}[foundational]
+At the moment a user-space trap fires, the CPU is still using the \textbf{user page table} (RISC-V does not switch page tables on trap entry). The code in \lstinline|stvec| must therefore be mapped in the user page table. But after saving registers, that code needs to switch to the kernel page table---and must still be reachable after the switch. The only way to satisfy both constraints is to map the same physical page at the same virtual address in \emph{both} tables. This page is the \textbf{trampoline}.
+\end{tcolorbox}
+
+% ---- 4.2 Kernel-space trap ---------------------------------
+\subsection{Case 2 — Trap from Kernel Space}
+
+\begin{tcolorbox}[lifecycle, title={Kernel-Space Trap Lifecycle}]
+
+\textbf{Entry:} \lstinline|kernelvec| (kernelvec.S:12) $\to$ \lstinline|kerneltrap| (trap.c:135)
+
+\medskip
+\textbf{Key differences from user-space traps:}
+
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.3em]
+  \item \textbf{[HW] Trap fires.} Same hardware actions as always, but \lstinline|stvec| already points to \lstinline|kernelvec| (set by \lstinline|usertrap| on kernel entry).
+
+  \item \textbf{[kernelvec] Save registers on the kernel stack.}
+        Since the kernel is already running with the kernel page table and a valid kernel stack, \lstinline|kernelvec| pushes all 32 registers directly onto the \emph{interrupted kernel thread's} stack. No page table switch is needed.
+
+  \item \textbf{[kerneltrap] Dispatch.}
+        \begin{itemize}[leftmargin=1.5em]
+          \item Device interrupt $\to$ \lstinline|devintr()|.
+          \item Any other exception $\to$ fatal; call \lstinline|panic()| and halt.
+          \item Timer interrupt $\to$ \lstinline|yield()| if a process kernel thread is running.
+        \end{itemize}
+
+  \item \textbf{[kerneltrap end] Restore and return.}
+        \lstinline|kerneltrap| restores \lstinline|sepc| and \lstinline|sstatus| (a \lstinline|yield()| may have disturbed them), then returns to \lstinline|kernelvec|.
+
+  \item \textbf{[kernelvec] Pop registers and sret.}
+        \lstinline|kernelvec| pops all saved registers from the kernel stack and executes \lstinline|sret|, resuming the interrupted kernel code.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[impldetail]
+\textbf{The stvec window:} When \lstinline|usertrap| first enters the kernel, \lstinline|stvec| is still pointing at \lstinline|uservec| for a brief window before it is updated to \lstinline|kernelvec|. RISC-V guarantees that interrupts are disabled when entering a trap, so no device interrupt can arrive during this window. xv6 does not enable interrupts again until after \lstinline|stvec| is safely set to \lstinline|kernelvec|.
+\end{tcolorbox}
+
+% ---- 4.3 System call arguments ----------------------------
+\subsection{Case 3 — System Call Argument Passing}
+
+\begin{tcolorbox}[lifecycle, title={System Call Argument Lifecycle}]
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.25em]
+  \item User code places arguments in registers \lstinline|a0|--\lstinline|a5| per the RISC-V C calling convention, and the system call number in \lstinline|a7|.
+  \item \lstinline|ecall| fires; \lstinline|uservec| saves all registers into the trapframe.
+  \item \lstinline|syscall()| reads \lstinline|a7| from the trapframe to look up the handler.
+  \item Kernel helper functions \lstinline|argint()|, \lstinline|argaddr()|, \lstinline|argfd()| retrieve the $n$-th argument from the trapframe.
+  \item For pointer arguments: \lstinline|fetchstr()| / \lstinline|copyinstr()| safely walk the \emph{user} page table to copy strings into kernel memory. \lstinline|copyout()| does the reverse.
+  \item The return value is written to \lstinline|p->trapframe->a0|, which \lstinline|userret| will restore to the user's \lstinline|a0|.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[foundational]
+\textbf{Why pointers from user space are dangerous:} A malicious user program may pass a pointer that (a) points into kernel memory, or (b) is mapped differently in the kernel's page table. The kernel \emph{must not} dereference user pointers directly using ordinary load/store instructions. Instead, it uses \lstinline|copyinstr| / \lstinline|copyout| which explicitly walk the \emph{user} page table, validate addresses with \lstinline|walkaddr|, and then copy data safely.
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+There are three trap paths: (1) user-space traps use the trampoline + trapframe dance to safely switch address spaces; (2) kernel-space traps are simpler because the kernel stack and page table are already set up; (3) system call argument retrieval goes through trapframe registers and requires special safe-copy helpers for pointer arguments.
+\end{tcolorbox}
+
+% ============================================================
+\section{Page-Fault Exceptions and Advanced VM Tricks}
+% ============================================================
+
+\subsection{xv6's Minimalist Response}
+
+In xv6, any exception in user space kills the process; any exception in the kernel causes a \lstinline|panic|. This is safe but not sophisticated.
+
+\subsection{What Real Systems Do with Page Faults}
+
+Page-fault exceptions are the foundation for several powerful virtual-memory features. The \lstinline|scause| register encodes the fault type; \lstinline|stval| holds the faulting virtual address.
+
+\begin{center}
+\begin{tabular}{@{}p{3.8cm}p{9cm}@{}}
+\toprule
+\textbf{Technique}         & \textbf{Mechanism} \\
+\midrule
+Copy-on-Write (COW) fork   & Parent and child share physical pages mapped read-only. On a write, a page-fault allocates a new page, copies content, and updates the PTE to allow writes. \lstinline|fork()| becomes cheap; copying is deferred until actually necessary. \\[0.4em]
+Lazy allocation            & \lstinline|sbrk()| only records the new size; it does not allocate pages. On the first access, a page-fault handler allocates and maps the page on demand. \\[0.4em]
+Demand paging              & \lstinline|exec| maps PTEs as invalid; pages are loaded from disk only when first accessed via a page fault. Reduces startup latency for large programs. \\[0.4em]
+Paging to disk             & Pages not recently used are evicted to a \emph{paging area} on disk and their PTEs marked invalid. A page fault on access pages them back in. \\[0.4em]
+Memory-mapped files        & File contents are mapped into the address space; faults load the relevant disk block on demand. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tcolorbox}[foundational]
+\textbf{The key insight:} By intercepting page faults, the kernel can \emph{lie to the application} about the state of memory (it doesn't have to be resident, writable, or even exist yet). This is the fundamental mechanism behind lazy memory management in all production OS kernels.
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+xv6 uses a trivially simple exception policy (kill or panic), but the chapter introduces how real kernels exploit page-fault exceptions for COW fork, lazy allocation, demand paging, and disk paging --- all transparent to user applications. These are all variations on the same theme: the trap handler allocates/fixes memory state and resumes the faulting instruction.
+\end{tcolorbox}
+
+% ============================================================
+\section{Foundational vs.\ Implementation Details}
+% ============================================================
+
+\subsection{Foundational Concepts (Must Understand)}
+
+\begin{tcolorbox}[foundational, title={Foundational Concepts}]
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.3em]
+  \item \textbf{Traps are the kernel's boundary crossing mechanism.}
+        Every interaction between a user process and the hardware or kernel goes through a trap. Understanding traps means understanding how the OS enforces isolation.
+
+  \item \textbf{The hardware--software contract.}
+        RISC-V does the minimum (save PC, set mode, jump). The kernel is responsible for everything else. This split is a deliberate design philosophy.
+
+  \item \textbf{The trampoline page solves the page-table bootstrapping problem.}
+        When a user-space trap fires, the MMU is still using the user page table. The trap handler must be mapped there. But the handler must also switch to the kernel page table. The trampoline, mapped identically in both, is the solution.
+
+  \item \textbf{Transparent trap handling.}
+        Normal code has no idea a trap occurred. The entire mechanism is designed so that execution can resume exactly where it left off, with all registers and state restored.
+
+  \item \textbf{User pointers cannot be trusted.}
+        The kernel must validate and copy user-supplied pointers/data using dedicated helper functions; direct dereference of user pointers is a security flaw.
+
+  \item \textbf{Page faults are the hook for lazy virtual memory.}
+        The OS can defer physical-memory work until it is actually needed by intercepting page faults. This pattern underlies COW fork, lazy allocation, demand paging, and swapping.
+\end{enumerate}
+\end{tcolorbox}
+
+\subsection{Implementation Details (Good to Know)}
+
+\begin{tcolorbox}[impldetail]
+\begin{itemize}[leftmargin=1.5em, itemsep=0.2em]
+  \item \lstinline|sscratch| is pre-loaded with the trapframe address by \lstinline|usertrapret| before returning to user space.
+  \item \lstinline|TRAPFRAME| is mapped just below \lstinline|TRAMPOLINE| in every user address space.
+  \item \lstinline|sepc| is saved into the trapframe by \lstinline|usertrap| because a \lstinline|yield()| call could corrupt the hardware \lstinline|sepc| register.
+  \item System call numbers are passed in \lstinline|a7|; return values in \lstinline|a0| (RISC-V C calling convention).
+  \item The \lstinline|sepc| for system calls is incremented by 4 to skip past the \lstinline|ecall| instruction.
+  \item \lstinline|kernelvec| saves registers on the kernel stack (not a trapframe), because the interrupted state belongs to that kernel thread.
+  \item \lstinline|kerneltrap| saves/restores \lstinline|sepc| and \lstinline|sstatus| because \lstinline|yield()| may disturb them.
+  \item xv6 avoids mapping kernel memory into the user page table (unlike some kernels) to reduce the risk of inadvertent user-pointer dereference bugs and to side-step address-space overlap issues.
+\end{itemize}
+\end{tcolorbox}
+
+% ============================================================
+\section{Quick-Reference: CSR Registers}
+% ============================================================
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}>{\ttfamily}lp{5.2cm}p{5.5cm}@{}}
+\toprule
+\textbf{Register} & \textbf{Role} & \textbf{Who writes / when} \\
+\midrule
+stvec    & Trap handler address          & Kernel: \lstinline|uservec| addr before returning to user; \lstinline|kernelvec| addr on kernel entry \\
+sepc     & Saved user/kernel PC          & HW on trap; kernel adds 4 for system calls \\
+scause   & Trap cause code               & HW on trap (read by kernel) \\
+sscratch & Scratch / trapframe pointer   & Kernel pre-loads before user return; \lstinline|uservec| swaps with \lstinline|a0| \\
+sstatus  & Interrupt enable; mode flag   & HW clears SIE on trap; kernel manages SIE for re-enabling \\
+satp     & Page table root               & \lstinline|uservec| switches user$\to$kernel; \lstinline|userret| switches kernel$\to$user \\
+stval    & Faulting address (page faults) & HW on page-fault (read by kernel handler) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Overall Chapter Summary}
+% ============================================================
+
+\begin{tcolorbox}[summary, title={Chapter 4 — Complete Summary}]
+Chapter 4 answers the question: \emph{how does the OS regain control of the CPU without breaking the illusion of continuous user execution?}
+
+The answer is the \textbf{trap mechanism}, a collaborative protocol between RISC-V hardware and the xv6 kernel:
+
+\begin{itemize}[leftmargin=1.5em, itemsep=0.2em]
+  \item \textbf{Hardware} atomically saves the PC, encodes the cause, switches to supervisor mode, and jumps to \lstinline|stvec|.
+  \item \textbf{Kernel assembly} (trampoline/\lstinline|kernelvec|) saves all registers and switches address spaces.
+  \item \textbf{Kernel C code} (\lstinline|usertrap|/\lstinline|kerneltrap|/\lstinline|syscall|) identifies and services the trap.
+  \item \textbf{Kernel assembly} (\lstinline|userret|/\lstinline|kernelvec|) restores all registers, switches address spaces back, and executes \lstinline|sret|.
+\end{itemize}
+
+Three separate paths exist for user-space traps, kernel-space traps, and timer interrupts, each optimised for its context. The trampoline and trapframe are the two key data structures that make the user-space path possible.
+
+Finally, the chapter uses page-fault exceptions to motivate advanced virtual-memory techniques (COW fork, lazy allocation, demand paging, disk paging) that production kernels implement by extending the same trap infrastructure.
+\end{tcolorbox}
+
+\end{document}

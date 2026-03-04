@@ -1,0 +1,662 @@
+% ============================================================
+%  xv6 RISC-V — Chapter 6: Locking
+%  Study Notes
+% ============================================================
+\documentclass[11pt, a4paper]{article}
+
+% --- Packages -----------------------------------------------
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+\usepackage{tcolorbox}
+\usepackage{multicol}
+\tcbuselibrary{skins, breakable}
+
+% --- Colours ------------------------------------------------
+\definecolor{summarybg}{RGB}{255, 252, 220}
+\definecolor{conceptbg}{RGB}{245, 235, 255}
+\definecolor{implbg}{RGB}{245, 245, 245}
+\definecolor{codegray}{RGB}{248, 248, 248}
+\definecolor{codeframe}{RGB}{180, 180, 180}
+\definecolor{keycolor}{RGB}{0, 80, 160}
+\definecolor{racered}{RGB}{180, 30, 30}
+\definecolor{spingreen}{RGB}{20, 110, 40}
+\definecolor{sleepblue}{RGB}{20, 60, 160}
+\definecolor{warningbg}{RGB}{255, 240, 240}
+\definecolor{goodbg}{RGB}{235, 255, 235}
+\definecolor{deadlockbg}{RGB}{255, 245, 225}
+\definecolor{membg}{RGB}{230, 245, 255}
+
+% --- Listings -----------------------------------------------
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  keepspaces=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  numbers=left,
+  numberstyle=\ttfamily\tiny\color{gray},
+  numbersep=6pt
+}
+
+% --- tcolorbox styles ---------------------------------------
+\tcbset{
+  summary/.style={
+    colback=summarybg, colframe=orange!60!black,
+    fonttitle=\bfseries\sffamily,
+    breakable, enhanced
+  },
+  foundational/.style={
+    colback=conceptbg, colframe=violet!60!black,
+    fonttitle=\bfseries\sffamily, title={Foundational Concept},
+    breakable, enhanced
+  },
+  impldetail/.style={
+    colback=implbg, colframe=gray!60,
+    fonttitle=\bfseries\sffamily, title={Implementation Detail},
+    breakable, enhanced
+  },
+  race/.style={
+    colback=warningbg, colframe=racered,
+    fonttitle=\bfseries\sffamily\color{racered},
+    breakable, enhanced, boxrule=1pt
+  },
+  good/.style={
+    colback=goodbg, colframe=spingreen,
+    fonttitle=\bfseries\sffamily\color{spingreen},
+    breakable, enhanced
+  },
+  deadlock/.style={
+    colback=deadlockbg, colframe=orange!80!black,
+    fonttitle=\bfseries\sffamily,
+    breakable, enhanced
+  },
+  spinlock/.style={
+    colback=spingreen!6, colframe=spingreen,
+    fonttitle=\bfseries\sffamily,
+    breakable, enhanced
+  },
+  sleeplock/.style={
+    colback=sleepblue!6, colframe=sleepblue,
+    fonttitle=\bfseries\sffamily,
+    breakable, enhanced
+  },
+  memorder/.style={
+    colback=membg, colframe=keycolor,
+    fonttitle=\bfseries\sffamily,
+    breakable, enhanced
+  },
+  warning/.style={
+    colback=warningbg, colframe=racered,
+    fonttitle=\bfseries\sffamily,
+    breakable, enhanced
+  }
+}
+
+% --- Section formatting -------------------------------------
+\titleformat{\section}{\large\bfseries\sffamily\color{keycolor}}{\thesection}{0.8em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries\sffamily}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalsize\itshape\sffamily}{\thesubsubsection}{0.5em}{}
+
+% --- Header / Footer ----------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\sffamily\small xv6 RISC-V Study Notes}
+\rhead{\sffamily\small Chapter 6: Locking}
+\cfoot{\thepage}
+
+% ============================================================
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries\sffamily Chapter 6: Locking}\\[0.4em]
+  {\large\sffamily xv6 RISC-V Study Notes}\\[0.2em]
+  {\small\itshape Based on Cox, Kaashoek \& Morris --- \emph{xv6: a simple, Unix-like teaching OS} (rev.\ 3, 2022)}
+\end{center}
+
+\vspace{0.5em}\hrule\vspace{1em}
+
+% ============================================================
+\section{Big Picture: What Problem Does This Chapter Solve?}
+% ============================================================
+
+\subsection{The Concurrency Problem}
+
+Modern kernels run on \emph{multiple CPUs simultaneously}, all sharing the same physical memory. Three distinct sources introduce concurrency:
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Multiprocessor parallelism} --- two CPUs execute kernel code at literally the same instant, both reading and writing the same data structures.
+  \item \textbf{Thread switching} --- even on a uniprocessor, the scheduler can switch a thread mid-operation, and another thread may observe a half-updated structure.
+  \item \textbf{Interrupt handlers} --- a device interrupt can fire at any instruction, running handler code that touches the same data as the interrupted thread.
+\end{enumerate}
+
+Without a concurrency control mechanism, these scenarios produce \textbf{races} --- bugs whose outcome depends on exact timing, making them nearly impossible to reproduce or debug reliably.
+
+\subsection{The Solution: Locks}
+
+A \textbf{lock} provides \emph{mutual exclusion}: only one CPU may hold a given lock at a time. Any shared data item guarded by a lock can only be accessed while that lock is held, ensuring that concurrent modifications never overlap.
+
+The price is \textbf{serialisation}: when two CPUs want the same lock, one must wait. This limits parallelism, so minimising unnecessary locking is a key performance concern.
+
+\begin{tcolorbox}[foundational]
+\textbf{What a lock really protects:} A lock does not protect a data item directly --- it protects the \emph{invariants} of that data. Invariants are properties that must always be true when the data is not being modified (e.g., ``every element's \lstinline|next| field points to a valid list member''). A critical section may temporarily violate invariants during an update, but the lock guarantees no other CPU can observe that intermediate state.
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Concurrency arises from multiprocessors, thread switching, and interrupts. It produces races --- silent, timing-dependent bugs. Locks enforce mutual exclusion by serialising access to critical sections, ensuring that invariants are only ever observed in a valid state.
+\end{tcolorbox}
+
+% ============================================================
+\section{Races: What Goes Wrong Without Locks}
+% ============================================================
+
+\subsection{The Classic Race: Concurrent List Push}
+
+Consider a singly-linked free list and a \lstinline|push| operation that two CPUs call simultaneously:
+
+\begin{lstlisting}[language=C, numbers=left]
+void push(int data) {
+    struct element *l = malloc(sizeof *l);
+    l->data = data;
+    l->next = list;   // line 15: both CPUs read old list head
+    list = l;         // line 16: both CPUs write -- one is lost
+}
+\end{lstlisting}
+
+\begin{tcolorbox}[race, title={What Goes Wrong}]
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.2em]
+  \item CPU1 executes line 15: \lstinline|l->next = list| (reads current head, say \lstinline|A|).
+  \item CPU2 executes line 15: \lstinline|l->next = list| (also reads \lstinline|A| --- same old head).
+  \item CPU1 executes line 16: \lstinline|list = l1| (head now points to CPU1's new node).
+  \item CPU2 executes line 16: \lstinline|list = l2| (overwrites CPU1's write --- \textbf{l1 is lost from the list}).
+\end{enumerate}
+Result: both new nodes point to \lstinline|A|, but \lstinline|l1| is unreachable. Memory leak and corrupted list.
+\end{tcolorbox}
+
+\subsection{Fixing It With a Lock}
+
+\begin{lstlisting}[language=C, numbers=left, firstnumber=6]
+struct element *list = 0;
+struct lock listlock;
+
+void push(int data) {
+    struct element *l = malloc(sizeof *l);
+    l->data = data;
+    acquire(&listlock);   // enter critical section
+    l->next = list;
+    list = l;
+    release(&listlock);   // exit critical section
+}
+\end{lstlisting}
+
+\begin{tcolorbox}[good, title={Why This Is Correct}]
+Lines 17--18 are now a \emph{critical section}. Only one CPU can hold \lstinline|listlock| at a time, so the two assignments are executed atomically with respect to each other. No CPU can observe the list with \lstinline|list| still pointing to the old head while \lstinline|l->next| already points there.
+\end{tcolorbox}
+
+\subsection{Key Terminology}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lp{10cm}@{}}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+Race           & A memory location is accessed concurrently, and at least one access is a write. Outcome depends on timing. \\
+Critical section & The sequence of instructions between \lstinline|acquire| and \lstinline|release|. \\
+Mutual exclusion & Property that only one CPU executes a critical section at a time. \\
+Invariant      & A property of a data structure that must hold when no operation is in progress. \\
+Contention     & Multiple CPUs competing for the same lock simultaneously. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+A race occurs when two CPUs interleave accesses to shared data, producing a lost update or corrupted structure. Wrapping the vulnerable instructions in \lstinline|acquire|/\lstinline|release| turns them into a critical section, ensuring atomicity with respect to other critical sections on the same lock.
+\end{tcolorbox}
+
+% ============================================================
+\section{Spinlock Implementation}
+% ============================================================
+
+\subsection{Why a Simple Read-Test-Write Loop Fails}
+
+The naive implementation shown below is \emph{broken} on a multiprocessor:
+
+\begin{lstlisting}[language=C, numbers=left, firstnumber=21]
+void acquire(struct spinlock *lk) {  // BROKEN
+    for(;;) {
+        if(lk->locked == 0) {    // line 25: both CPUs see 0
+            lk->locked = 1;      // line 26: both set 1 -- both think they hold the lock
+            break;
+        }
+    }
+}
+\end{lstlisting}
+
+Two CPUs can simultaneously pass line 25 (both see \lstinline|locked == 0|) and both set it to 1 on line 26, both believing they hold the lock. Mutual exclusion is violated.
+
+\subsection{The Fix: Atomic Read-Modify-Write}
+
+Lines 25 and 26 must be made a \emph{single atomic step}. RISC-V provides the \lstinline|amoswap r, a| instruction for exactly this:
+
+\begin{tcolorbox}[foundational]
+\textbf{\lstinline|amoswap r, a|} atomically swaps the value in register \lstinline|r| with the value at memory address \lstinline|a|. Special hardware ensures no other CPU can access address \lstinline|a| between the read and the write. The old memory value is placed in \lstinline|r|.
+
+xv6's \lstinline|acquire| uses the C library wrapper \lstinline|__sync_lock_test_and_set|, which compiles to \lstinline|amoswap|. It atomically writes 1 to \lstinline|lk->locked| and returns the previous value. If the previous value was 0, we just acquired the lock. If it was 1, someone else holds it; we spin and retry.
+\end{tcolorbox}
+
+\subsection{acquire and release}
+
+\begin{tcolorbox}[spinlock, title={Spinlock: acquire (kernel/spinlock.c:22)}]
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.2em]
+  \item Call \lstinline|push_off()| --- disable interrupts on this CPU (see \S\ref{sec:intrlocks}).
+  \item Panic if the lock is already held by this CPU (detects re-entrant acquire).
+  \item Spin in a loop calling \lstinline|__sync_lock_test_and_set(&lk->locked, 1)| until it returns 0, meaning we have swapped 0 out --- we now hold the lock.
+  \item Issue a \lstinline|__sync_synchronize()| memory barrier (see \S\ref{sec:memorder}).
+  \item Record \lstinline|lk->cpu = mycpu()| for debugging.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[spinlock, title={Spinlock: release (kernel/spinlock.c:47)}]
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.2em]
+  \item Panic if the lock is not held by this CPU.
+  \item Clear \lstinline|lk->cpu = 0|.
+  \item Issue a \lstinline|__sync_synchronize()| memory barrier.
+  \item Call \lstinline|__sync_lock_release(&lk->locked)| --- atomically writes 0, releasing the lock.
+  \item Call \lstinline|pop_off()| --- potentially re-enable interrupts on this CPU.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+A naïve test-then-set acquire is broken on multiprocessors because the test and set are not atomic. RISC-V's \lstinline|amoswap| combines them into one indivisible hardware operation. xv6 wraps this in \lstinline|acquire|/\lstinline|release|, adding interrupt disabling and memory barriers around the atomic swap.
+\end{tcolorbox}
+
+% ============================================================
+\section{Using Locks: Granularity and Guidelines}
+% ============================================================
+
+\subsection{When to Lock}
+
+Two basic rules determine when a lock is needed:
+
+\begin{enumerate}[leftmargin=2em]
+  \item If a variable can be written by one CPU while another CPU reads or writes it, use a lock.
+  \item If an invariant involves multiple memory locations, a \emph{single} lock must protect all of them together so no CPU can observe a partial update.
+\end{enumerate}
+
+\subsection{Coarse-Grained vs.\ Fine-Grained Locking}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lp{5.2cm}p{5.2cm}@{}}
+\toprule
+& \textbf{Coarse-grained} & \textbf{Fine-grained} \\
+\midrule
+Description  & One lock for a large subsystem & Many locks, each covering a small resource \\
+Parallelism  & Low: only one CPU at a time & High: different CPUs work on different resources \\
+Complexity   & Low: easy to reason about & Higher: more locks, more risk of deadlock \\
+xv6 example & \lstinline|kmem.lock| (one lock for entire page allocator) & \lstinline|ip->lock| (one lock per inode) \\
+Extreme case & ``Big kernel lock'' --- one lock for the whole kernel & Per-field locking \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Lock placement matters too.} Moving \lstinline|acquire| earlier than necessary serialises more work (e.g., serialising \lstinline|malloc| inside the push critical section is wasteful). Lock acquisition should be as close to the critical section as correctness permits.
+
+\subsection{All Locks in xv6 (Figure 6.3)}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}>{\ttfamily}lp{9cm}@{}}
+\toprule
+\textbf{Lock} & \textbf{What It Protects} \\
+\midrule
+bcache.lock   & Allocation of block buffer cache entries \\
+cons.lock     & Serialises console hardware access; prevents intermixed output \\
+ftable.lock   & Serialises allocation of \lstinline|struct file| entries in the file table \\
+itable.lock   & Protects allocation of in-memory inode entries \\
+vdisk\_lock   & Serialises disk hardware access and DMA descriptor queue \\
+kmem.lock     & Serialises kernel memory (page) allocation \\
+log.lock      & Serialises operations on the transaction log \\
+pipe pi->lock & Serialises operations on each individual pipe \\
+pid\_lock     & Serialises increments of \lstinline|next_pid| \\
+proc p->lock  & Serialises changes to a process's state fields \\
+wait\_lock    & Helps prevent lost wakeups in \lstinline|wait| \\
+tickslock     & Serialises operations on the \lstinline|ticks| counter \\
+inode ip->lock& Serialises operations on each inode and its content \\
+buf b->lock   & Serialises operations on each individual block buffer \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Every shared variable that can be concurrently written needs a lock. The granularity of locking is a trade-off: coarse locks are simple but limit parallelism; fine-grained locks allow more concurrency but raise the complexity and deadlock risk. xv6 uses a mix of both, with one notable example of each.
+\end{tcolorbox}
+
+% ============================================================
+\section{Deadlock and Lock Ordering}
+% ============================================================
+
+\subsection{What Is a Deadlock?}
+
+\begin{tcolorbox}[deadlock, title={Deadlock: The Classic Scenario}]
+Two threads each need two locks, but acquire them in opposite orders:
+
+\medskip
+\begin{tabular}{lll}
+& \textbf{Thread T1} & \textbf{Thread T2} \\
+Step 1: & \lstinline|acquire(A)| & \lstinline|acquire(B)| \\
+Step 2: & \lstinline|acquire(B)| $\leftarrow$ \textbf{waits} & \lstinline|acquire(A)| $\leftarrow$ \textbf{waits} \\
+\end{tabular}
+
+\medskip
+T1 holds A and waits for B. T2 holds B and waits for A. Neither can proceed. The system is stuck.
+\end{tcolorbox}
+
+\subsection{The Global Lock Ordering Rule}
+
+\begin{tcolorbox}[foundational]
+\textbf{Global lock ordering:} All code paths in the kernel that must hold multiple locks simultaneously must acquire them in the \emph{same global order}. This is the only reliable way to prevent deadlock with spinlocks.
+
+Lock ordering effectively makes locks part of each function's specification: callers must invoke functions in a way that respects the agreed-upon order.
+\end{tcolorbox}
+
+\subsection{Why Ordering Is Hard in Practice}
+
+Lock ordering becomes difficult when:
+\begin{itemize}[leftmargin=1.5em]
+  \item The lock order conflicts with module boundaries (module M1 calls M2, but M2's lock must be acquired before M1's lock).
+  \item Lock identities are not known in advance --- e.g., the file system discovers locks as it traverses a path name, and the \lstinline|wait|/\lstinline|exit| code searches a process table.
+  \item More fine-grained locking creates longer chains, increasing the chance of ordering conflicts.
+\end{itemize}
+
+\subsection{xv6's Longest Lock Chains}
+
+The file system contains xv6's most complex lock ordering requirements. Creating a file requires simultaneously holding:
+\begin{enumerate}[leftmargin=2em]
+  \item The directory lock
+  \item The new file's inode lock
+  \item A disk block buffer lock
+  \item \lstinline|vdisk_lock| (disk driver)
+  \item The calling process's \lstinline|p->lock|
+\end{enumerate}
+These must always be acquired in exactly this order to prevent deadlock.
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Deadlock occurs when threads wait for each other's locks in a cycle. The only solution with spinlocks is a global acquisition order respected by all code paths. This order is a design constraint that must be documented and enforced; it becomes increasingly difficult as locking schemes grow more fine-grained.
+\end{tcolorbox}
+
+% ============================================================
+\section{Re-entrant Locks}
+% ============================================================
+
+Re-entrant (recursive) locks allow a thread that already holds a lock to acquire it again without deadlocking. They seem like a convenience, but xv6 deliberately avoids them.
+
+\begin{tcolorbox}[race, title={Why Re-entrant Locks Are Dangerous}]
+Consider two functions \lstinline|f| and \lstinline|g|, both protecting \lstinline|data| with \lstinline|lock|, and \lstinline|call_once()| is expected to run exactly once:
+
+\begin{lstlisting}[language=C, numbers=none]
+f() { acquire(&lock); if(data==0){ call_once(); h(); data=1; } release(&lock); }
+g() { acquire(&lock); if(data==0){ call_once(); data=1; } release(&lock); }
+\end{lstlisting}
+
+If \lstinline|h()| internally calls \lstinline|g()|:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Non-re-entrant (xv6):} \lstinline|g()| panics or deadlocks --- immediately visible bug.
+  \item \textbf{Re-entrant:} \lstinline|g()| re-enters successfully. \lstinline|call_once()| is invoked \emph{twice} --- a silent correctness bug.
+\end{itemize}
+
+Re-entrant locks break the intuition that a lock makes a critical section atomic with respect to other critical sections on the same lock.
+\end{tcolorbox}
+
+\textbf{xv6's choice:} Non-re-entrant spinlocks. A deadlock is a loud, observable failure that forces the programmer to fix the lock ordering. A silent double-call is far harder to discover.
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Re-entrant locks appear to solve some deadlock problems but undermine the atomicity guarantee that makes locks useful. xv6 uses non-re-entrant locks: an erroneous re-acquire causes a visible panic rather than a silent invariant violation.
+\end{tcolorbox}
+
+% ============================================================
+\section{Locks and Interrupt Handlers}
+\label{sec:intrlocks}
+% ============================================================
+
+\subsection{The Interrupt-Deadlock Hazard}
+
+\begin{tcolorbox}[race, title={The Interrupt Deadlock Scenario}]
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.2em]
+  \item Kernel thread \lstinline|sys_sleep| acquires \lstinline|tickslock|.
+  \item A timer interrupt fires on the \emph{same CPU}.
+  \item The timer interrupt handler \lstinline|clockintr| tries to acquire \lstinline|tickslock|.
+  \item \lstinline|clockintr| spins forever --- \lstinline|tickslock| is held by \lstinline|sys_sleep|.
+  \item \lstinline|sys_sleep| can never run again (its CPU is in the interrupt handler) --- it can never release \lstinline|tickslock|.
+  \item \textbf{Deadlock.} The CPU freezes.
+\end{enumerate}
+\end{tcolorbox}
+
+\subsection{xv6's Solution: Disable Interrupts on Acquire}
+
+\begin{tcolorbox}[foundational]
+\textbf{Rule:} A CPU must never hold a spinlock with interrupts enabled on \emph{that same CPU}. xv6 enforces this by calling \lstinline|push_off()| at the start of every \lstinline|acquire|, which disables interrupts on the local CPU.
+
+Note: interrupts on \emph{other} CPUs are unaffected. An interrupt handler on another CPU can still spin-wait for a thread on a different CPU to release a lock --- this is safe.
+\end{tcolorbox}
+
+\subsection{Nested Critical Sections: push\_off / pop\_off}
+
+Disabling interrupts must be \emph{counted} to handle nesting correctly:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \lstinline|acquire| calls \lstinline|push_off()| (\lstinline|kernel/spinlock.c:89|), which saves the current interrupt-enable state and disables interrupts. A nesting counter is incremented.
+  \item \lstinline|release| calls \lstinline|pop_off()| (\lstinline|kernel/spinlock.c:100|), which decrements the counter. Only when the counter reaches zero are interrupts re-enabled (to the state saved at the outermost \lstinline|push_off|).
+\end{itemize}
+
+\begin{tcolorbox}[warning, title={Critical Ordering Constraint}]
+\lstinline|push_off()| must be called \textbf{before} \lstinline|lk->locked| is set. If the order were reversed, there would be a brief window where the lock is held but interrupts are still enabled --- a badly timed interrupt in that window would cause the deadlock described above.
+
+Similarly, \lstinline|pop_off()| must be called \textbf{after} \lstinline|lk->locked| is cleared, never before.
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Spinlocks and interrupt handlers on the same CPU can deadlock if the CPU holds a lock that the interrupt handler tries to acquire. xv6 prevents this by disabling interrupts on the current CPU for the entire duration any spinlock is held. Nested locks are handled with a push/pop counter that restores the original interrupt state at the outermost release.
+\end{tcolorbox}
+
+% ============================================================
+\section{Instruction and Memory Ordering}
+\label{sec:memorder}
+% ============================================================
+
+\subsection{The Problem}
+
+It is natural to assume that instructions execute in the order written. This is \emph{wrong} in multi-threaded code:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Compilers} reorder load/store instructions for efficiency (e.g., keeping values in registers, eliminating redundant stores).
+  \item \textbf{CPUs} execute instructions out of order, speculatively, or in parallel when there are no data dependencies between them.
+\end{itemize}
+
+\begin{tcolorbox}[race, title={A Dangerous Reordering Example}]
+\begin{lstlisting}[language=C, numbers=left]
+acquire(&listlock);
+l->next = list;   // line 4: must happen before line 5
+list = l;         // line 5
+release(&listlock);
+\end{lstlisting}
+
+If the compiler or CPU moved line 4 to \emph{after} \lstinline|release| (line 6), another CPU could acquire the lock, see the updated \lstinline|list|, and then find \lstinline|l->next| still uninitialised. Catastrophic corruption.
+\end{tcolorbox}
+
+\subsection{Memory Barriers}
+
+\begin{tcolorbox}[memorder, title={Memory Barriers (\lstinline|__sync_synchronize()|)}]
+A \textbf{memory barrier} is an instruction that tells both the compiler and the CPU:
+\begin{itemize}[leftmargin=1.5em]
+  \item Do not move any load or store instruction from one side of this barrier to the other.
+\end{itemize}
+
+xv6 inserts \lstinline|__sync_synchronize()| in both \lstinline|acquire| and \lstinline|release|:
+\begin{itemize}[leftmargin=1.5em]
+  \item The barrier in \lstinline|acquire| ensures all loads/stores inside the critical section happen \emph{after} the lock is acquired.
+  \item The barrier in \lstinline|release| ensures all loads/stores inside the critical section happen \emph{before} the lock is released.
+\end{itemize}
+
+This prevents the lock-straddling reorderings that would violate mutual exclusion.
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Compilers and CPUs both reorder memory operations for performance. Without barriers, instructions could move outside critical section boundaries, violating mutual exclusion even with a correct lock implementation. Memory barriers in \lstinline|acquire| and \lstinline|release| prevent all such reorderings.
+\end{tcolorbox}
+
+% ============================================================
+\section{Sleep Locks}
+% ============================================================
+
+\subsection{The Spinlock Limitation}
+
+Spinlocks waste CPU time while spinning. This is acceptable for short critical sections (a few instructions), but becomes a serious problem when a lock must be held for a long time --- for example, while waiting for a disk read that takes tens of milliseconds.
+
+Two related problems make holding a spinlock for a long time illegal in xv6:
+\begin{enumerate}[leftmargin=2em]
+  \item A process cannot \lstinline|yield()| the CPU while holding a spinlock (which would allow scheduling to run --- but the scheduler itself acquires locks, risking deadlock).
+  \item Interrupts must be disabled while holding a spinlock, so holding one for a long time prevents interrupt handling entirely.
+\end{enumerate}
+
+\subsection{Sleep Locks: The Solution}
+
+\begin{tcolorbox}[sleeplock, title={Sleep Lock Design (kernel/sleeplock.c:22)}]
+A sleep lock has a \lstinline|locked| field protected by an \emph{internal spinlock}. The key difference:
+
+\begin{itemize}[leftmargin=1.5em, itemsep=0.25em]
+  \item \lstinline|acquiresleep(lk)|: if the lock is held, it calls \lstinline|sleep()| --- which atomically releases the spinlock and yields the CPU. The thread is blocked until the lock is free.
+  \item \lstinline|releasesleep(lk)|: sets \lstinline|locked = 0| and calls \lstinline|wakeup()| to wake any waiting thread.
+  \item Interrupts remain \textbf{enabled} while holding a sleep lock.
+  \item The CPU is free to \textbf{run other processes} while a thread waits for a sleep lock.
+\end{itemize}
+\end{tcolorbox}
+
+\subsection{Spinlock vs.\ Sleep Lock: When to Use Which}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Property}               & \textbf{Spinlock}   & \textbf{Sleep Lock} \\
+\midrule
+Waiting behaviour               & Spins (wastes CPU)  & Yields CPU (sleeps) \\
+Interrupts while held           & \textbf{Disabled}   & Enabled \\
+Can yield while held            & \textbf{No}         & Yes \\
+Can use in interrupt handlers   & Yes                 & \textbf{No} \\
+Can use inside spinlock section & N/A                 & \textbf{No} \\
+Best for                        & Short critical sections & Long I/O operations \\
+xv6 example                     & \lstinline|kmem.lock|, \lstinline|cons.lock| & File system inode lock \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tcolorbox}[warning, title={Sleep Lock Restrictions}]
+\begin{itemize}[leftmargin=1.5em]
+  \item Sleep locks \textbf{cannot} be used inside spinlock critical sections --- \lstinline|acquiresleep| may yield the CPU, violating the spinlock invariant.
+  \item Sleep locks \textbf{cannot} be used in interrupt handlers --- interrupt handlers cannot sleep.
+  \item Spinlocks \emph{can} be used inside sleep-lock critical sections.
+\end{itemize}
+\end{tcolorbox}
+
+\begin{tcolorbox}[summary, title={Section Summary}]
+Spinlocks are inappropriate when a lock must be held for a long time (e.g., disk I/O). Sleep locks solve this by yielding the CPU while waiting, keeping interrupts enabled and allowing other processes to run. The trade-off is that sleep locks cannot be used in interrupt handlers or inside spinlock critical sections.
+\end{tcolorbox}
+
+% ============================================================
+\section{Foundational vs.\ Implementation Details}
+% ============================================================
+
+\subsection{Foundational Concepts (Must Understand)}
+
+\begin{tcolorbox}[foundational, title={Foundational Concepts}]
+\begin{enumerate}[leftmargin=1.8em, itemsep=0.3em]
+  \item \textbf{Locks protect invariants, not data.} The lock ensures that no other CPU observes a data structure while its invariants are temporarily violated during an update.
+
+  \item \textbf{Atomic read-modify-write is the hardware foundation.} Without a single atomic instruction (like \lstinline|amoswap|), no correct software lock is possible on a multiprocessor.
+
+  \item \textbf{Global lock ordering is the only deadlock-free strategy with spinlocks.} All code paths must acquire multiple locks in the same order. This constraint must be documented and enforced as part of each subsystem's interface.
+
+  \item \textbf{Spinlocks must disable interrupts on the holding CPU.} Otherwise, an interrupt handler that tries to acquire the same lock deadlocks the CPU.
+
+  \item \textbf{Memory barriers prevent compiler/CPU reordering across lock boundaries.} Without them, instructions can move outside critical sections, breaking mutual exclusion even with a correct lock.
+
+  \item \textbf{Two lock types serve two different use cases.} Spinlocks for short critical sections (safe in interrupt handlers); sleep locks for long-running operations (yield the CPU but cannot be used in interrupt context).
+\end{enumerate}
+\end{tcolorbox}
+
+\subsection{Implementation Details (Good to Know)}
+
+\begin{tcolorbox}[impldetail]
+\begin{itemize}[leftmargin=1.5em, itemsep=0.2em]
+  \item \lstinline|struct spinlock| (\lstinline|kernel/spinlock.h:2|) has three fields: \lstinline|locked| (0 or 1), \lstinline|name| (debug string), \lstinline|cpu| (which CPU holds it).
+  \item \lstinline|acquire| uses \lstinline|__sync_lock_test_and_set|; \lstinline|release| uses \lstinline|__sync_lock_release| --- both compile to \lstinline|amoswap| on RISC-V.
+  \item \lstinline|push_off|/\lstinline|pop_off| use a per-CPU nesting counter (\lstinline|cpu->noff|) and a saved interrupt state (\lstinline|cpu->intena|).
+  \item \lstinline|__sync_synchronize()| compiles to a RISC-V \lstinline|fence| instruction, which enforces memory ordering at the hardware level.
+  \item xv6's \lstinline|kalloc.c| uses a single coarse-grained lock (\lstinline|kmem.lock|); a per-CPU free list design with work-stealing would reduce contention.
+  \item Re-entrant acquire is detected by checking if \lstinline|lk->cpu == mycpu()| before spinning; xv6 panics in this case.
+  \item \lstinline|acquiresleep| (\lstinline|kernel/sleeplock.c:22|) holds a spinlock internally while calling \lstinline|sleep()|; \lstinline|sleep| atomically releases the spinlock and puts the thread to sleep, avoiding a lost-wakeup window.
+\end{itemize}
+\end{tcolorbox}
+
+% ============================================================
+\section{Real World Context}
+% ============================================================
+
+\subsection{Lock Contention and Cache Costs}
+
+The performance cost of locks is not just spinning --- it has a hardware dimension. When CPU A holds a lock, the lock variable is in A's cache. When CPU B tries to acquire it, the cache coherence protocol must transfer the cache line from A to B. This \emph{cache line migration} can be orders of magnitude more expensive than a cache hit. High contention means frequent migration, which can be more costly than the actual work being serialised.
+
+\subsection{Alternatives to Locks}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lp{9cm}@{}}
+\toprule
+\textbf{Technique} & \textbf{Description} \\
+\midrule
+Lock-free data structures & Use atomic instructions to build structures that require no locks (e.g., lock-free linked lists). Harder to reason about; require deep understanding of memory ordering. \\
+Per-CPU data & Give each CPU its own copy of a data structure; eliminate sharing. xv6 could use per-CPU free lists to reduce \lstinline|kmem| contention. \\
+Pthreads (user space) & POSIX thread library provides user-level locks, barriers, and condition variables; requires OS support (sleeping blocked pthreads, TLB shootdown, etc.). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{xv6 Limitations}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item xv6 avoids lock-free programming for simplicity; locking is already complex enough.
+  \item The coarse \lstinline|kmem.lock| is a known bottleneck for allocation-heavy workloads.
+  \item xv6 has no support for POSIX threads at the user level.
+\end{itemize}
+
+\begin{tcolorbox}[summary, title={Chapter 6 --- Complete Summary}]
+Chapter 6 addresses the correctness challenges that arise when the kernel runs concurrently on multiple CPUs.
+
+\begin{itemize}[leftmargin=1.5em, itemsep=0.2em]
+  \item \textbf{Races} occur when concurrent accesses to shared data overlap --- they are silent, timing-dependent bugs.
+  \item \textbf{Locks} prevent races by ensuring mutual exclusion. They protect the invariants of shared data structures.
+  \item \textbf{Spinlocks} are built on \lstinline|amoswap|, the RISC-V atomic swap instruction, wrapped with memory barriers (\lstinline|__sync_synchronize|) and interrupt-disable bookkeeping (\lstinline|push_off|/\lstinline|pop_off|).
+  \item \textbf{Deadlock} is prevented by a global lock acquisition order respected by all code paths.
+  \item \textbf{Re-entrant locks} are avoided: a visible deadlock is safer than a silent double-entry bug.
+  \item \textbf{Interrupts must be disabled} on a CPU while it holds any spinlock on that CPU, to prevent interrupt-handler deadlocks.
+  \item \textbf{Memory barriers} in acquire/release prevent the compiler and CPU from reordering accesses outside critical section boundaries.
+  \item \textbf{Sleep locks} complement spinlocks for long-held locks: they yield the CPU while waiting, keep interrupts enabled, but cannot be used in interrupt handlers or inside spinlock sections.
+\end{itemize}
+\end{tcolorbox}
+
+\end{document}

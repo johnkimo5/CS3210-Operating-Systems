@@ -1,0 +1,304 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{booktabs}
+
+% Code listing style
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray}\itshape,
+    stringstyle=\color{red},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4
+}
+
+\title{\textbf{CS3210: Operating Systems} \\ Lecture 1 --- Introduction and Course Overview}
+\author{John Kim \\ Georgia Institute of Technology}
+\date{January 13, 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{What is an Operating System?}
+% ============================================================
+
+\subsection{Three Classical Responsibilities}
+
+Before diving into the technical content of the course, it is worth asking a deceptively simple
+question: \emph{what is an operating system?} The classical textbook answer is that an operating
+system has three responsibilities: \textbf{managing the computer's resources}, \textbf{establishing
+a user interface}, and \textbf{executing and providing services for applications}. While this
+enumeration is broadly accurate, it is worth considering a richer perspective.
+
+Professor Tumanov's preferred definition is more conceptually tight: \emph{an operating system
+abstracts \textbf{inconvenient} low-level interfaces into \textbf{convenient} high-level
+interfaces.} This framing places \emph{abstraction} at the center of OS design rather than
+listing capabilities, and will remain the organizing lens for the entire course.
+
+\subsection{Abstractions as the Core Mechanism}
+
+Operating systems work by providing \textbf{abstractions} that hide the complexity and inconvenience
+of the underlying hardware. Consider two canonical examples. First, a single physical CPU is
+abstract\-ed into the illusion of many independent processes running concurrently---this is
+\textbf{multiplexing}. Second, a single flat set of physical memory cells is made to look like
+many independent, isolated address spaces, one per process. In both cases the OS interposes
+between the hardware and the application, translating a difficult-to-use physical resource into
+a convenient logical one.
+
+A useful question to ask throughout the course is: what \emph{other} abstractions can you think
+of? The lesson is that the pattern is universal and the design space is vast.
+
+\subsection{Properties of OS Abstractions}
+
+Good OS abstractions exhibit a cluster of desirable properties. The full list includes:
+
+\begin{itemize}
+    \item \textbf{Isolation} --- one process's faults or misbehavior cannot corrupt another's state.
+    \item \textbf{Multiplexing} --- a single physical resource can be shared among multiple
+          consumers simultaneously.
+    \item \textbf{Naming} --- resources are given human-meaningful or process-meaningful names
+          (e.g., file paths, process IDs) rather than raw hardware addresses.
+    \item \textbf{Atomicity} --- certain operations are guaranteed to complete entirely or not at
+          all, with no partial visible state in between.
+    \item \textbf{Reliability / Fault Tolerance} --- the system continues to function correctly
+          despite individual component failures.
+    \item \textbf{Persistence} --- state can survive beyond the lifetime of any individual process
+          or even a system reboot.
+    \item \textbf{Resource Management} --- the OS enforces policies for sharing CPU time, memory,
+          disk I/O, and network bandwidth fairly and efficiently across all running processes.
+\end{itemize}
+
+Not every abstraction exhibits all of these properties; part of OS design is deciding which
+properties matter most for a given context and making the necessary trade-offs.
+
+% ============================================================
+\section{Managing Complexity Through Abstraction}
+% ============================================================
+
+A recurring theme in systems is that abstraction is the primary tool for managing complexity.
+The lecture presented a three-layer model that captures how abstraction enables systems to scale:
+
+\begin{enumerate}
+    \item \textbf{Learning Algorithm / Common Patterns} (top layer) --- identifies recurring
+          computation patterns in applications (e.g., map-reduce, iterative gradient descent,
+          request--response).
+    \item \textbf{Abstraction (API)} (middle layer) --- defines a \emph{narrow interface} through
+          which the application expresses its intent without specifying implementation details.
+    \item \textbf{System} (bottom layer) --- exploits the limited, well-defined interface to
+          address system design challenges such as parallelism, data locality, networking,
+          scheduling, fault tolerance, and stragglers.
+\end{enumerate}
+
+The power of the narrow API in the middle is that it allows the system below to change freely
+(e.g., to improve performance, change scheduling policy, or tolerate faults) without requiring
+changes to the applications above. This \emph{decoupling} is what makes large-scale systems
+tractable.
+
+\subsection{What Counts as an Operating System?}
+
+This layered model raises an interesting boundary question: what counts as an ``operating
+system''? The classic answer is the kernel. But Richard Stallman famously argued for a broader
+view: the GNU project is the operating system, and Linux is merely one of its kernels. In his
+formulation, the tools, libraries, and user-space infrastructure together constitute the OS.
+
+For this course we will focus on the kernel layer---the ring-0 x86 software that directly manages
+hardware. We use \textbf{xv6}, a small but complete teaching kernel developed at MIT, as our
+primary vehicle for hands-on projects. xv6 is small enough to read and modify but rich enough to
+illustrate all core OS mechanisms.
+
+% ============================================================
+\section{Course Overview}
+% ============================================================
+
+\subsection{Design as a First-Class Goal}
+
+The course title is \emph{Design of Operating Systems}, and the emphasis on \emph{design} is
+intentional. Many OS courses focus primarily on describing how existing systems work. This course
+goes further: students are expected to understand \emph{why} particular abstractions exist,
+\emph{what} trade-offs they encode, and how to \emph{design} systems from scratch given
+conflicting constraints. As Prof.\ Tumanov put it, the goal is for students to be able to
+``understand, express, and quantify the \textbf{trade-offs} in system design.''
+
+\subsection{Course Structure}
+
+The course is primarily \textbf{project-based}. Students work directly in the xv6 kernel---a real
+x86 ring-0 environment---rather than a simulator. Approximately 55\% of the final grade is
+determined by four lab projects; two midterm exams account for the remaining 40\%, with a small
+supervised-lab component making up the last 3\%.
+
+The lab projects are substantial. Prof.\ Tumanov estimates that each lab will take approximately
+\textbf{30 hours}, with Lab 3 potentially requiring 40--50 hours. Students should plan for
+roughly \textbf{10 hours per week} of lab work during active lab periods. The autograder accepts
+only $k$ feedback-given submissions per day, so starting early is not merely advisable---it is a
+structural requirement of the course. The autograder reports how \emph{complete} a solution is,
+not \emph{what is wrong with it}; students must write their own unit tests to diagnose failures.
+
+The grading breakdown is as follows:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Item} & \textbf{Weight} \\
+\midrule
+Lab 0 (XV6 orientation) & 2\% \\
+Lab 1 (Startup, CPU stacks, debugging, physical memory) & 10\% \\
+Lab 2 & 15\% \\
+Lab 3 & 20\% \\
+Lab 4 & 10\% \\
+Supervised Labs & 3\% \\
+Exam 1 & 20\% \\
+Exam 2 & 20\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Note that the withdrawal deadline falls between Lab 2 and Lab 3, giving students a concrete
+checkpoint at which to assess their standing before committing to the more demanding second half
+of the course.
+
+\subsection{Scope and Limitations}
+
+Operating systems are enormous software artifacts---millions of lines of code, highly complex,
+and far broader than just their kernels. No single course can cover the full breadth of useful OS
+knowledge. The course explicitly covers the subset of OS concepts that (a) can be meaningfully
+implemented in xv6, (b) illuminate important design trade-offs, and (c) will be tested on exams.
+Students should come in with that expectation and use the course as a foundation for independent
+exploration later.
+
+% ============================================================
+\section{Prerequisites and Course Policies}
+% ============================================================
+
+\subsection{Prerequisites}
+
+Operating systems sit at a low level of the software stack and interact directly with hardware.
+The course therefore requires a broad and solid background. The \emph{strict} prerequisites---
+without which a student will struggle---are:
+
+\begin{itemize}
+    \item \textbf{C programming} --- all kernel code is written in C; pointer manipulation,
+          memory allocation, and low-level bit operations are used throughout.
+    \item \textbf{Linux shell} --- projects are developed and debugged on the command line;
+          comfort with shell scripting, \texttt{make}, \texttt{gdb}, and related tools is assumed.
+    \item \textbf{CS 2200 (Systems and Networks)} --- a thorough understanding of computer
+          organization, instruction sets, system calls, and basic networking is required.
+\end{itemize}
+
+The \emph{recommended} (but not strictly required) prerequisites are CS 2110 (Computer
+Organization and Programming) and CS 3220 (Processor Design). Students lacking these are still
+welcome but should expect to work harder on the hardware-facing parts of the course.
+
+A \textbf{diagnostic quiz} will be available on Gradescope during the first week (due Friday,
+January 16, 2026). Its purpose is twofold: it lets the teaching staff calibrate supervised lab
+topics to actual knowledge gaps, and it lets each student honestly assess their own preparedness
+before the withdrawal deadline.
+
+\subsection{Classroom Conduct and Participation}
+
+The course is delivered \textbf{in-person only}. Lectures are not recorded as a default, though
+select key lectures (e.g., Virtual Memory Management, Scheduling, File Systems, Atomicity) may
+be recorded and shared through Canvas as exam preparation aids. Attendance is strongly encouraged
+and considered essential even though it is not formally graded.
+
+Students are encouraged to ask questions at any time during lecture. The only conduct norm is
+mutual respect: questions should stem from genuine curiosity, not from a desire to signal prior
+knowledge. All students, regardless of background, identity, or experience, are entitled to a
+comfortable and inclusive learning environment.
+
+\subsection{Academic Integrity}
+
+Lab projects may be completed individually or in pairs (groups of 1--2). \emph{You may not share
+code with anyone outside your partnership.} The distinction between permissible collaboration and
+cheating is framed as follows: \textbf{cheating} is a one-sided exchange (one party benefits from
+the other's work without reciprocal learning); \textbf{collaboration} is both parties discovering
+and solving problems together. When in doubt, the correct action is to avoid sharing and ask the
+course staff for clarification.
+
+Georgia Tech's Honor Code applies in full. Students are expected to uphold the ideals of honor
+and integrity in all work submitted for this course.
+
+\subsection{Engineering Ethics and Impact}
+
+The lecture closed with a broader observation about engineering responsibility. Competence in
+systems design is not merely an academic exercise---systems that are poorly designed, or
+credentials obtained dishonestly, can have real-world consequences that extend far beyond the
+individual engineer. Students are expected to take both their learning and their integrity
+seriously for this reason.
+
+% ============================================================
+\section{Upcoming Assignments}
+% ============================================================
+
+The following tasks are due in the first two weeks of the semester:
+
+\begin{itemize}
+    \item \textbf{Diagnostic Quiz} --- due Friday, January 16, 2026 (available on Gradescope).
+          Also serves as a Phase II registration checkpoint.
+    \item \textbf{Notecard} --- a short personal introduction for the instructor, due Friday
+          January 16, 2026.
+    \item \textbf{Lab 0} (Get to Know XV6) --- assigned January 16; due January 23, 2026.
+    \item \textbf{Lab 1} (Startup, CPU Stacks, Debugging, Physical Memory) --- assigned January
+          23; due February 6, 2026. Students have two weeks.
+\end{itemize}
+
+The first reading assignment is also due soon: James Mickens, ``The Night Watch,''
+\url{https://www.usenix.org/system/files/1311_05-08_mickens.pdf}. Although ungraded, this essay
+is required reading and sets a memorable tone for the kind of thinking this course values.
+
+% ============================================================
+\section{Summary}
+% ============================================================
+
+\begin{itemize}
+    \item \textbf{Operating system definition}: An OS abstracts \emph{inconvenient} low-level
+          hardware interfaces into \emph{convenient} high-level ones for applications.
+    \item \textbf{Abstraction properties}: Key properties of OS abstractions include isolation,
+          multiplexing, naming, atomicity, reliability, persistence, and resource management.
+    \item \textbf{Three-layer model}: Systems manage complexity by identifying common patterns,
+          defining a narrow API, and exploiting that API to address parallelism, scheduling,
+          fault tolerance, and other system-level challenges.
+    \item \textbf{Course design focus}: CS3210 emphasizes understanding and quantifying
+          design trade-offs, not just describing how existing systems work.
+    \item \textbf{xv6}: The primary project vehicle is xv6, a real x86 ring-0 kernel; all
+          lab work involves modifying actual kernel code.
+    \item \textbf{Grading}: 55\% labs (4 projects), 40\% exams (2), 3\% supervised labs;
+          workload is approximately 30 hours per lab.
+    \item \textbf{Integrity}: Collaboration between lab partners is encouraged; sharing code
+          with non-partners is cheating. The Honor Code applies in full.
+\end{itemize}
+
+% ============================================================
+\section{References}
+% ============================================================
+
+\begin{itemize}
+    \item Tumanov, A. \textit{CS3210: Design of Operating Systems --- Lecture 1 Slides}.
+          Georgia Institute of Technology. January 13, 2026.
+    \item Mickens, J. ``The Night Watch.'' \textit{USENIX ;login: Logout}. November 2013.
+          \url{https://www.usenix.org/system/files/1311_05-08_mickens.pdf}
+    \item Silberschatz, A.; Galvin, P. B.; Gagne, G. \textit{Operating System Concepts}.
+          10th ed. John Wiley \& Sons. 2018.
+    \item Cox, R.; Kaashoek, F.; Morris, R. \textit{xv6: a simple, Unix-like teaching operating
+          system}. MIT CSAIL. \url{https://pdos.csail.mit.edu/6.828/2022/xv6.html}
+\end{itemize}
+
+% ============================================================
+\section*{Personal Notes}
+% ============================================================
+% Add your own notes below this line
+
+\end{document}

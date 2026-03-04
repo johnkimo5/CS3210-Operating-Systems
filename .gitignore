@@ -1,0 +1,12 @@
+# Ignore everything
+*
+
+# Allow directory traversal
+!*/
+
+# Keep .tex and .pdf files
+!*.tex
+!*.pdf
+
+# Keep this gitignore
+!.gitignore
