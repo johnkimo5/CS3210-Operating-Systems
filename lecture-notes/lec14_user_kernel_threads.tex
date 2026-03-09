@@ -142,6 +142,7 @@ Four classical benefits of threading are:
     \item \textbf{Resource sharing}: Threads share memory and resources by design. In contrast, processes have separate address spaces; sharing data between them requires explicit IPC (pipes, shared memory segments, etc.).
     \item \textbf{Economy}: Thread creation and destruction is much faster than process creation. Context switching between threads has less overhead because there is no page-table switch.
     \item \textbf{Multiprocessors}: On a system with multiple CPUs, threads can achieve \emph{true} parallelism rather than merely the single-processor illusion of time-sharing.
+    \item Note, it's not that we can eliminate context switching, we just have less overhead.
 \end{itemize}
 
 \subsection{Design Considerations for Supporting Threads}
