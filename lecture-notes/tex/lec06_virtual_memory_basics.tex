@@ -1,0 +1,469 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{booktabs}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray}\itshape,
+    stringstyle=\color{red},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4
+}
+
+\title{\textbf{CS3210: Operating Systems} \\ Lecture 6 --- Virtual Memory: The Basics}
+\author{John Kim \\ Georgia Institute of Technology}
+\date{February 3, 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Introduction: Why Virtual Memory?}
+% ============================================================
+
+\textbf{Virtual memory} is the technique by which the operating system presents each process with the illusion of its own private, contiguous address space, even though many processes share a single physical RAM. It is one of the most consequential abstractions in systems design, enabling four distinct capabilities that the hardware alone cannot provide.
+
+\begin{enumerate}
+    \item \textbf{Isolation}: each process's virtual address space is separate from every other's. A misbehaving process cannot read or corrupt another process's memory because the mappings in its page tables simply do not include the other process's physical pages. This directly realizes the isolation guarantees introduced in Lecture 4.
+    \item \textbf{Resource multiplexing}: virtual memory makes one physical address space appear as many independent virtual address spaces. The hardware multiplexes physical RAM among all running processes under OS control, so each process sees a contiguous private address space starting at virtual address 0.
+    \item \textbf{Overcoming resource limits}: a process's virtual address space may be \emph{larger} than the physical RAM installed in the machine. Pages that are not currently needed can be \emph{swapped} to disk, brought back on demand. This is why a 64-bit process can allocate far more virtual memory than the machine physically has.
+    \item \textbf{Protection}: by controlling the permission bits stored in each page table entry, the OS can enforce fine-grained read/write/execute policies on every page. A stack page can be marked non-executable; a read-only code segment cannot be modified.
+\end{enumerate}
+
+This lecture focuses on the mechanics of how virtual-to-physical address translation actually works on x86, with particular attention to xv6's implementation.
+
+% ============================================================
+\section{x86 Address Translation: The Big Picture}
+% ============================================================
+
+On x86, a CPU-generated address passes through \emph{two} sequential translation stages before it reaches physical RAM.
+
+\begin{enumerate}
+    \item \textbf{Segment translation}: the CPU takes a \emph{logical address} consisting of a 16-bit \textbf{segment selector} and a 32-bit \textbf{offset}. The segment selector indexes a descriptor table (GDT or LDT) to obtain a base address, which is added to the offset to produce a \textbf{linear address}.
+    \item \textbf{Page translation}: the linear address is fed into the paging unit, which walks the page table hierarchy stored in memory to produce the final \textbf{physical address}.
+\end{enumerate}
+
+The \emph{virtual address} that programmers reason about is the \textbf{linear address}---the 32-bit quantity produced after segment translation and consumed by the paging unit. On modern x86 systems (including xv6) all segment bases are set to zero, so the logical offset and the linear address are numerically identical; segmentation effectively disappears. The serious isolation work is done entirely by paging.
+
+% ============================================================
+\section{Segmentation Revisited: GDT, LDT, and Flat Segments}
+% ============================================================
+
+\textbf{Segmentation} was the original x86 memory protection mechanism. It relies on two in-memory tables.
+
+\subsection{Global and Local Descriptor Tables}
+
+The \textbf{Global Descriptor Table (GDT)} is a system-wide array of \emph{segment descriptors}; its physical address is loaded into the \texttt{GDTR} register. Every process on the machine shares the same GDT. The \textbf{Local Descriptor Table (LDT)} is a per-process descriptor table, but it is used very rarely in modern operating systems.
+
+Each segment descriptor encodes three things: a \textbf{base} (the physical address where the segment starts), a \textbf{limit} (the physical address where it ends), and \textbf{flags} including the \emph{Default Privilege Level} (DPL). Segmentation registers (\texttt{CS}, \texttt{DS}, \texttt{SS}, etc.) hold 16-bit selectors that index into the GDT or LDT as appropriate. The instruction pointer register \texttt{EIP} uses the \textbf{Code Segment (\texttt{CS})} register; the stack pointer \texttt{ESP} uses the \textbf{Stack Segment (\texttt{SS})} register; and general data loads/stores use the \textbf{Data Segment (\texttt{DS})} register.
+
+\subsection{Flat Segmentation in xv6}
+
+During the boot sequence (\texttt{bootasm.S}) xv6 installs a minimal bootstrap GDT with three entries: a null descriptor, a code segment, and a data segment, both with base \texttt{0x0} and limit \texttt{0xffffffff}:
+
+\begin{lstlisting}[language=C, caption={Bootstrap GDT in bootasm.S}]
+gdt:
+  SEG_NULLASM                              # null seg
+  SEG_ASM(STA_X|STA_R, 0x0, 0xffffffff)   # code seg
+  SEG_ASM(STA_W,        0x0, 0xffffffff)   # data seg
+\end{lstlisting}
+
+Once the full kernel is running, \texttt{seginit()} replaces this with a four-entry GDT per CPU covering kernel code (\texttt{SEG\_KCODE}), kernel data (\texttt{SEG\_KDATA}), user code (\texttt{SEG\_UCODE}), and user data (\texttt{SEG\_UDATA}):
+
+\begin{lstlisting}[language=C, caption={seginit() in vm.c}]
+void seginit(void) {
+    struct cpu *c = &cpus[cpunum()];
+    c->gdt[SEG_KCODE] = SEG(STA_X|STA_R, 0, 0xffffffff, DPL_KERN);
+    c->gdt[SEG_KDATA] = SEG(STA_W,       0, 0xffffffff, DPL_KERN);
+    c->gdt[SEG_UCODE] = SEG(STA_X|STA_R, 0, 0xffffffff, DPL_USER);
+    c->gdt[SEG_UDATA] = SEG(STA_W,       0, 0xffffffff, DPL_USER);
+    lgdt(c->gdt, sizeof(c->gdt));
+}
+\end{lstlisting}
+
+All four segments share base \texttt{0x0} and limit \texttt{0xffffffff}. This is \textbf{flat segmentation}: every logical address translates to an identical linear address, so segmentation contributes nothing to isolation. The DPL fields (\texttt{DPL\_KERN} = 0, \texttt{DPL\_USER} = 3) are used for privilege checks, but actual memory protection is left entirely to paging.
+
+\subsection{Segmentation vs.\ Paging}
+
+Segmentation's one advantage is that it avoids the per-access overhead of a page table walk. Paging's advantages, however, are decisive: it avoids external fragmentation (all physical frames are equal size), it allows very large virtual address spaces, and it provides much finer-grained multiplexing of physical memory. Paging is therefore the better \emph{isolation and protection} mechanism, and modern operating systems rely on it almost exclusively.
+
+% ============================================================
+\section{Two-Level Paging on x86}
+% ============================================================
+
+The x86 32-bit paging hardware partitions the 32-bit linear address into three fields:
+
+\[
+\underbrace{b_{31} \ldots b_{22}}_{10\ \text{bits: Dir}} \quad
+\underbrace{b_{21} \ldots b_{12}}_{10\ \text{bits: Table}} \quad
+\underbrace{b_{11} \ldots b_{0}}_{12\ \text{bits: Offset}}
+\]
+
+These three fields drive a two-level lookup in physical memory, ultimately resolving the linear address to a \emph{physical address} composed of a 20-bit \textbf{Physical Page Number (PPN)} concatenated with the 12-bit offset.
+
+\subsection{The Page Directory (PD)}
+
+The root of the page table hierarchy is the \textbf{Page Directory (PD)}, a 4~KB array of 1024 \textbf{Page Directory Entries (PDEs)}. The physical address of the PD is stored in the \textbf{CR3} control register. Critically, \emph{CR3 holds a physical address}, not a virtual one: the paging unit has not yet been activated when CR3 is first loaded during boot, and even when paging is active, CR3 must be resolvable without translation.
+
+Each PDE is a 32-bit quantity whose upper 20 bits are the PPN of a second-level \textbf{Page Table (PT)}, and whose lower 12 bits are flags. The 10-bit ``Dir'' field of the linear address selects which of the 1024 PDEs to consult ($2^{10} = 1024$ entries). The PD occupies exactly one 4~KB physical frame---a convenient size since a single frame is the unit of physical allocation.
+
+\subsection{The Page Table (PT) and Page Table Entries (PTEs)}
+
+The PDE retrieved from the PD points to a second-level Page Table, also a 4~KB array of 1024 \textbf{Page Table Entries (PTEs)}. The 10-bit ``Table'' field of the linear address indexes into this PT ($2^{10} = 1024$ entries). Each PTE's upper 20 bits give the PPN of the final physical memory frame, and the lower 12 bits are again permission and status flags.
+
+\subsection{Complete Translation Walk}
+
+Putting the two levels together, a full virtual-to-physical translation proceeds in five steps:
+
+\begin{enumerate}
+    \item Load the physical address of the Page Directory from \textbf{CR3}.
+    \item Use the 10 most-significant bits of the linear address (``Dir'') to \emph{index into the PD} and retrieve the PDE.
+    \item Use the PPN in the PDE to locate the Page Table in physical memory.
+    \item Use the next 10 bits of the linear address (``Table'') to \emph{index into the PT} and retrieve the PTE containing the PPN of the physical frame.
+    \item Concatenate that PPN with the 12-bit ``Offset'' from the linear address to form the final physical address.
+\end{enumerate}
+
+This two-level walk requires \textbf{two memory accesses} for every address translation (one PD lookup + one PT lookup), which is confirmed by the uniform class response of 100\%. A $k$-level page table requires $k$ memory accesses per translation in the worst case.
+
+% ============================================================
+\section{PTE and PDE Flag Bits}
+% ============================================================
+
+Both PDEs and PTEs pack permission and status information into their lower 12 bits. The most important flags are:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Bit} & \textbf{Name} & \textbf{Meaning} \\
+\midrule
+0 & P (Present)       & Page or page table is in physical memory \\
+1 & W (Writable)      & Page may be written; clear = read-only \\
+2 & U (User)          & Accessible from ring 3; clear = kernel only \\
+3 & WT                & Write-through caching (vs.\ write-back when 0) \\
+4 & CD                & Cache disabled for this page \\
+5 & A (Accessed)      & Set by hardware on any read/write \\
+6 & D (Dirty)         & Set by hardware on any write (PTE only) \\
+7 & PS (Page Size)    & PDE only: 0 = 4~KB page, 1 = 4~MB page (superpage) \\
+8 & G (Global)        & Page not flushed from TLB on CR3 reload \\
+9--11 & AVL            & Available for OS use \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The \textbf{P bit} is the most critical: if it is clear, any access to that virtual address generates a \emph{page fault}. The OS handles page faults to implement swapping, copy-on-write, and demand paging. The \textbf{U/W bits} implement the coarse-grained isolation guarantees: kernel pages are mapped with U=0 (inaccessible to user processes) and the \texttt{read-only} code segment has W=0.
+
+% ============================================================
+\section{Bootstrapping Paging in xv6}
+% ============================================================
+
+There is a chicken-and-egg problem at boot time: to enable paging we must load a page table address into CR3, but to construct a page table we normally need to allocate physical pages---which requires \emph{some} form of address translation to be operational first.
+
+xv6 resolves this bootstrap problem with a \textbf{statically allocated boot page directory} called \texttt{entrypgdir}, defined in \texttt{main.c}:
+
+\begin{lstlisting}[language=C, caption={entrypgdir in main.c --- the xv6 bootstrap page directory}]
+__attribute__((__aligned__(PGSIZE)))
+pde_t entrypgdir[NPDENTRIES] = {
+    // Map VA's [0, 4MB) to PA's [0, 4MB)
+    [0] = (0) | PTE_P | PTE_W | PTE_PS,
+    // Map VA's [KERNBASE, KERNBASE+4MB) to PA's [0, 4MB)
+    [KERNBASE>>PDXSHIFT] = (0) | PTE_P | PTE_W | PTE_PS,
+};
+\end{lstlisting}
+
+Because the \texttt{PTE\_PS} flag is set, each of these two entries is a \textbf{4~MB superpage}---a single-level mapping that requires no second-level page table. The \texttt{Dir} field is used directly as a 10-bit index into the PD, and the remaining 22 bits of the linear address are used as a byte offset within the 4~MB region.
+
+The two entries in \texttt{entrypgdir} create two mappings, both pointing to the same first 4~MB of physical RAM:
+\begin{itemize}
+    \item \textbf{Virtual [0, 4MB) $\to$ Physical [0, 4MB)}: an identity mapping used during the first moments after paging is enabled, when the CPU's \texttt{EIP} still holds a low physical address.
+    \item \textbf{Virtual [KERNBASE, KERNBASE+4MB) $\to$ Physical [0, 4MB)}: the high-memory mapping through which the kernel will execute once it relocates to \texttt{KERNBASE} (\texttt{0x80000000}).
+\end{itemize}
+
+The \texttt{entry.S} assembly loads this directory into CR3 and then sets the \texttt{PG} and \texttt{WP} bits in CR0 to enable paging:
+
+\begin{lstlisting}[language={[x86masm]Assembler}, caption={Loading entrypgdir and enabling paging in entry.S}]
+    movl    $(V2P_WO(entrypgdir)), %eax
+    movl    %eax, %cr3          # set page directory
+    movl    %cr0, %eax
+    orl     $(CR0_PG|CR0_WP), %eax
+    movl    %eax, %cr0          # turn on paging
+\end{lstlisting}
+
+Note that \texttt{V2P\_WO} converts the virtual address of \texttt{entrypgdir} to a physical address (by subtracting \texttt{KERNBASE}), because CR3 must hold a physical address.
+
+\subsection{Initialization Phases: kinit1 and kinit2}
+
+Once the bootstrap page directory is active, \texttt{main()} proceeds in two phases to build the complete physical allocator and full kernel page table:
+
+\begin{enumerate}
+    \item \textbf{kinit1()} (in \texttt{kalloc.c}): with paging still using \texttt{entrypgdir}, kinit1 places only the physical pages that \emph{are already mapped} by \texttt{entrypgdir} onto the free list. This gives the kernel just enough memory to allocate the full kernel page table.
+    \item \textbf{kinit2()}: called after \texttt{kvmalloc()} has installed a full page table on all cores, kinit2 adds all remaining physical pages (up to \texttt{PHYSTOP}) to the free list.
+\end{enumerate}
+
+% ============================================================
+\section{The xv6 Virtual Address Space Layout}
+% ============================================================
+
+xv6 partitions the 32-bit virtual address space at \textbf{KERNBASE = 0x80000000}. Addresses below this boundary are \emph{user space}; addresses at or above it are \emph{kernel space}.
+
+\begin{lstlisting}[language=C, caption={xv6 virtual address space layout}]
++----> +--------------------+ <= 0xFFFFFFFF
+|      |    free memory     |
+|      +--------------------+
+kernel |   kernel text/data | 4MB
+space  +--------------------+ <= 0x80100000
+(CPL=0)|        BIOS        |
++----> +--------------------+ <= 0x80000000 (KERNBASE)
+|      |        heap        |
+|      +--------------------+
+ user  |       stack        |
+space  +--------------------+
+(CPL=3)|   user text/data   |
++----> +--------------------+ <= 0x00000000
+\end{lstlisting}
+
+The kernel segment begins at \texttt{0x80000000}. The BIOS occupies the first portion of the kernel segment (\texttt{0x80000000}--\texttt{0x80100000}), followed by the kernel text and read-only data, then kernel data and free memory growing upward. User processes occupy the lower half of the address space from \texttt{0x00000000} to \texttt{0x80000000}.
+
+The critical implication is that the same physical kernel pages are mapped at high virtual addresses in \emph{every} process's page table. When a user process traps into the kernel, the CPU's instruction pointer jumps to high addresses without requiring a page table switch---the kernel is always mapped. Only the user half of the page table differs between processes.
+
+% ============================================================
+\section{Physical Page Management in xv6}
+% ============================================================
+
+xv6's physical memory allocator (in \texttt{kalloc.c}) maintains a \textbf{singly-linked free list} of available 4~KB pages. Rather than maintaining a separate data structure, xv6 embeds the \texttt{struct run} (the free-list pointer) \emph{inside} the free page itself, at the page's first bytes. This design avoids the need for any separate allocator metadata. Because a physical page is either on the free list or owned by exactly one entity (the kernel mapping or one user process), physical page tracking is simple and binary.
+
+\texttt{kfree()} is the key function for returning a page to the free list:
+
+\begin{lstlisting}[language=C, caption={kfree() in kalloc.c}]
+void kfree(char *v) {
+    struct run *r;
+    if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
+        panic("kfree");
+    // Fill with junk to catch dangling references
+    memset(v, 1, PGSIZE);
+    if(kmem.use_lock) acquire(&kmem.lock);
+    r = (struct run*)v;
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+    if(kmem.use_lock) release(&kmem.lock);
+}
+\end{lstlisting}
+
+Several defensive measures stand out. First, \texttt{kfree} panics if the pointer is not page-aligned, if it falls below the end of the kernel's static data, or if its physical address exceeds \texttt{PHYSTOP}. Second, the \texttt{memset(v, 1, PGSIZE)} fills the just-freed page with the value \texttt{0x01}, causing any code that still holds a dangling pointer to that page to read garbage rather than old valid data---an important debugging aid.
+
+\subsection{xv6's Page Sharing Limitation}
+
+In stock xv6, each physical page may be mapped by at most two page table entries: one in the kernel mapping (which appears in every address space) and at most one in a user mapping. There is no reference counter; physical page tracking is binary (free or owned). This design simplifies the allocator but makes \emph{copy-on-write} and \emph{shared libraries} effectively impossible without modification---features that Lab~2 asks students to implement.
+
+% ============================================================
+\section{Page Table Management in xv6}
+% ============================================================
+
+Building and walking page tables is the job of three functions in \texttt{vm.c}: \texttt{setupkvm}, \texttt{mappages}, and \texttt{walkpgdir}.
+
+\subsection{The Kernel Memory Map: kmap}
+
+The kernel's virtual address space is defined by the static \texttt{kmap[]} table. This table describes which regions of physical memory should be mapped at which kernel virtual addresses in \emph{every} process's page table:
+
+\begin{lstlisting}[language=C, caption={Kernel memory map kmap[] in vm.c}]
+static struct kmap {
+    void *virt; uint phys_start; uint phys_end; int perm;
+} kmap[] = {
+    { (void*)KERNBASE, 0,          EXTMEM,    PTE_W},  // I/O space
+    { (void*)KERNLINK, V2P(KERNLINK), V2P(data), 0},   // kern text+rodata
+    { (void*)data,     V2P(data),  PHYSTOP,   PTE_W},  // kern data+memory
+    { (void*)DEVSPACE, DEVSPACE,   0,         PTE_W},  // more devices
+};
+\end{lstlisting}
+
+Notice that the kernel text and read-only data segment is mapped with \texttt{perm = 0} (no \texttt{PTE\_W}), making it non-writable even at ring~0. This guards against accidental corruption of kernel instructions.
+
+\subsection{setupkvm: Building the Kernel Page Table}
+
+\texttt{setupkvm()} allocates a new, zeroed page directory and then calls \texttt{mappages} for each entry in \texttt{kmap[]}:
+
+\begin{lstlisting}[language=C, caption={setupkvm() in vm.c}]
+pde_t* setupkvm(void) {
+    pde_t *pgdir;
+    if((pgdir = (pde_t*)kalloc()) == 0) return 0;
+    memset(pgdir, 0, PGSIZE);
+    if(P2V(PHYSTOP) > (void*)DEVSPACE) panic("PHYSTOP too high");
+    for(k = kmap; k < &kmap[NELEM(kmap)]; k++)
+        if(mappages(pgdir, k->virt,
+                    k->phys_end - k->phys_start,
+                    (uint)k->phys_start, k->perm) < 0) {
+            freevm(pgdir); return 0;
+        }
+    return pgdir;
+}
+\end{lstlisting}
+
+\subsection{mappages: Installing PTEs}
+
+\texttt{mappages(pgdir, va, size, pa, perm)} installs PTEs to map a contiguous virtual range to a contiguous physical range. It iterates page-by-page, calling \texttt{walkpgdir} to locate or allocate the PTE, then writes the physical address and flags:
+
+\begin{lstlisting}[language=C, caption={mappages() in vm.c}]
+static int mappages(pde_t *pgdir, void *va,
+                    uint size, uint pa, int perm) {
+    char *a, *last;
+    pte_t *pte;
+    a    = (char*)PGROUNDDOWN((uint)va);
+    last = (char*)PGROUNDDOWN(((uint)va) + size - 1);
+    for(;;) {
+        if((pte = walkpgdir(pgdir, a, 1)) == 0) return -1;
+        if(*pte & PTE_P) panic("remap");
+        *pte = pa | perm | PTE_P;
+        if(a == last) break;
+        a += PGSIZE; pa += PGSIZE;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+The \texttt{panic("remap")} guard prevents accidentally overwriting an existing mapping---a sanity check that would catch double-mapping bugs immediately.
+
+\subsection{walkpgdir: Software Page Walk}
+
+\texttt{walkpgdir} is the software equivalent of what the x86 MMU does in hardware. Given a page directory, a virtual address, and an \texttt{alloc} flag, it returns a pointer to the PTE for that address (allocating a new page table frame if necessary):
+
+\begin{lstlisting}[language=C, caption={walkpgdir() in vm.c}]
+static pte_t* walkpgdir(pde_t *pgdir,
+                        const void *va, int alloc) {
+    pde_t *pde;
+    pte_t *pgtab;
+    pde = &pgdir[PDX(va)];          // index into page directory
+    if(*pde & PTE_P) {
+        pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
+    } else {
+        if(!alloc || (pgtab = (pte_t*)kalloc()) == 0)
+            return 0;
+        memset(pgtab, 0, PGSIZE);   // zero all PTE_P bits
+        *pde = V2P(pgtab) | PTE_P | PTE_W | PTE_U;
+    }
+    return &pgtab[PTX(va)];         // index into page table
+}
+\end{lstlisting}
+
+The macro \texttt{PDX(va)} extracts the top 10 bits; \texttt{PTX(va)} extracts the next 10 bits. \texttt{PTE\_ADDR(*pde)} masks off the lower 12 flag bits to get the PPN, and \texttt{P2V} converts it to a virtual address so the kernel can use it. When \texttt{alloc = 1} and the PDE is not yet present, a new page table frame is allocated with \texttt{kalloc()}, zeroed (ensuring all PTEs start with \texttt{PTE\_P = 0}), and installed in the PDE with permission flags \texttt{PTE\_P | PTE\_W | PTE\_U}---the PDE itself is given loose permissions because the individual PTEs enforce fine-grained access control.
+
+% ============================================================
+\section{Multilevel Paging: Design Tradeoffs}
+% ============================================================
+
+The two-level design is a careful balance between several competing overheads.
+
+\subsection{Why Not Single-Level Paging?}
+
+A flat, single-level page table for a 32-bit address space with 4~KB pages would need $2^{20} = 1{,}048{,}576$ entries. At 4 bytes per entry that is \textbf{4~MB of page table per process}. With dozens of processes running simultaneously, the aggregate overhead becomes prohibitive. Furthermore, most processes use only a small portion of their 4~GB virtual address space, so the vast majority of entries would be empty and wasted.
+
+\subsection{Benefits of Two Levels}
+
+The two-level hierarchy exploits sparsity. A process that uses only a few megabytes of virtual address space needs only the page directory (4~KB, always present) plus a handful of page tables (4~KB each), rather than 4~MB. Page tables for unmapped regions of the virtual address space simply do not need to exist: the corresponding PDE has its \texttt{P} bit clear, and no second-level allocation is required.
+
+\subsection{Single-Level 4~MB Paging}
+
+When the \texttt{PS} bit is set in a PDE the directory entry directly maps a \textbf{4~MB superpage}, bypassing the second level entirely. The 32-bit linear address is then split as 10 bits (directory index) + 22 bits (superpage offset). xv6 uses this exclusively during boot (\texttt{entrypgdir}) to avoid the chicken-and-egg problem of needing allocated memory to store page tables before the allocator is running.
+
+\subsection{Overheads of Multilevel Paging}
+
+Two overhead categories apply at any number of levels:
+
+\begin{itemize}
+    \item \textbf{Memory overhead}: the aggregate physical memory consumed by all page directory and page table frames for all processes (the ``sum of all PTPs'').
+    \item \textbf{Latency overhead}: every memory access by a user process requires $k$ additional memory accesses (one per level of the page table hierarchy) to perform the translation. Without hardware assistance, this would double or quadruple every memory operation.
+\end{itemize}
+
+\subsection{Four-Level Paging in x86\_64}
+
+The 64-bit x86 architecture (\emph{IA-32e} mode) extends the two-level design to \textbf{four levels} to accommodate the larger address space. A 48-bit canonical virtual address is partitioned as 9 + 9 + 9 + 9 + 12 bits, using four levels: PML4 $\to$ PDPT $\to$ PD $\to$ PT $\to$ physical frame. Each table fits in one 4~KB frame. The same idea---bit segments are indices into tables, intermediate levels point to other tables, the final level points to the physical address---applies unchanged; there are simply more levels of indirection.
+
+% ============================================================
+\section{The Memory Management Unit and TLB}
+% ============================================================
+
+Performing two (or four) memory accesses for every single load or store instruction would be catastrophically slow. The hardware mitigates this with dedicated translation caching.
+
+\subsection{The MMU and Translation Lookaside Buffer}
+
+The \textbf{Memory Management Unit (MMU)} is the hardware unit that performs the page walk automatically, completely transparent to software. When a virtual address is presented, the MMU first consults its dedicated cache---the \textbf{Translation Lookaside Buffer (TLB)}---for a cached virtual-to-physical mapping.
+
+On a \textbf{TLB hit}, the physical address is returned immediately, with no additional memory accesses. On a \textbf{TLB miss}, the MMU performs a full page table walk in hardware (consulting CR3, then each level of the hierarchy), writes the result back into the TLB, and delivers the physical address. If the walk discovers that the page's \texttt{P} bit is clear, the MMU raises a \textbf{page fault exception}, transferring control to the OS's fault handler.
+
+Specialized TLB variants exist for further optimization: the \textbf{iTLB} caches translations for instruction fetches only, while the \textbf{dTLB} caches translations for data accesses only. Splitting them reduces contention between the instruction-fetch pipeline and the load/store pipeline.
+
+\subsection{TLB Flush on Process Switch}
+
+Each process has a different page directory, so the virtual-to-physical mappings in the TLB are process-specific. When the OS switches processes by loading a new value into CR3, the hardware \textbf{flushes the entire TLB}---all cached translations are invalidated. The new process's early memory accesses therefore suffer TLB misses until the TLB is warm. This TLB flush is a significant part of why context switches are expensive.
+
+% ============================================================
+\section{Applications and Limitations of Paging}
+% ============================================================
+
+\subsection{What Paging Enables}
+
+Paging is a powerful substrate for a variety of OS and user-level optimizations:
+
+\begin{itemize}
+    \item \textbf{Kernel tricks (one zero-filled page)}: rather than allocating and zeroing a new physical page for every \texttt{brk()} call that extends a process's heap, the OS can map all newly allocated virtual pages to a single shared read-only zero page. On the first write, a page fault fires and the OS allocates a real page. This is \emph{lazy zero-page allocation}.
+    \item \textbf{Copy-on-write (CoW) fork}: when \texttt{fork()} is called, instead of copying the entire parent address space, the OS marks all pages in both parent and child as read-only in their respective page tables. Both processes share physical pages. The first write by either process triggers a page fault, at which point the OS allocates a fresh private copy of the faulted page. CoW can make \texttt{fork()} nearly instantaneous for processes that immediately call \texttt{exec()}.
+    \item \textbf{Memory-mapped files (\texttt{mmap})}: file contents can be mapped into the virtual address space. File I/O is then transparently performed through loads and stores rather than explicit \texttt{read}/\texttt{write} system calls.
+\end{itemize}
+
+\subsection{xv6's Page Sharing Limitation}
+
+In stock xv6, at most two entities can hold a mapping to any single physical page: the kernel's global mapping and at most one user process. There is no per-page reference counter. This simplicity makes CoW and shared library support essentially impossible without modification. Lab~2 asks students to implement copy-on-write forking and lazy zero-page allocation, both of which require adding reference counting to the physical page allocator.
+
+\subsection{Research Perspective}
+
+The power of page-based virtual memory extends to distributed systems. \textbf{Snowflock} (EuroSys 2009) used on-demand paging, copy-on-write, and selective page transfer to fork a virtual machine to an entire networked cluster in under one second. \textbf{Kaleidoscope} (EuroSys 2011) applied VM state coloring for efficient stateful VM replication in cloud environments. \textbf{On-Demand-Fork} (EuroSys 2021) extended these ideas to achieve microsecond-latency fork for memory-intensive applications.
+
+% ============================================================
+\section{Summary}
+% ============================================================
+
+\begin{itemize}
+    \item \textbf{Virtual memory motivations}: isolation, resource multiplexing (1 physical $\to$ many virtual spaces), overcoming physical limits (swapping), and protection.
+    \item \textbf{x86 address pipeline}: Logical address $\to$ Segment translation $\to$ Linear (virtual) address $\to$ Page translation $\to$ Physical address. In xv6, all segment bases are 0 (flat), so virtual = linear.
+    \item \textbf{Flat segmentation in xv6}: \texttt{seginit()} creates four segments all with base 0 and limit \texttt{0xffffffff}; segmentation contributes no isolation.
+    \item \textbf{Two-level paging}: a 32-bit linear address is split 10+10+12. CR3 (physical address) $\to$ Page Directory $\to$ Page Table $\to$ physical frame. Each level is a 4~KB array of 1024 32-bit entries.
+    \item \textbf{PDE/PTE flags}: P (present), W (writable), U (user-accessible), PS (superpage), and others.
+    \item \textbf{CR3 holds a physical address}: the paging unit must resolve CR3 without address translation.
+    \item \textbf{entrypgdir}: xv6's bootstrap page directory maps two 4~MB superpages (VA [0,4MB) and VA [KERNBASE, KERNBASE+4MB)) both to PA [0,4MB), solving the chicken-and-egg paging bootstrap problem.
+    \item \textbf{xv6 address space}: KERNBASE (\texttt{0x80000000}) divides user space (below) from kernel space (above). Kernel mappings appear in every process's page table.
+    \item \textbf{TLB}: hardware cache for VA$\to$PA translations. TLB flush on CR3 reload is a major source of context-switch overhead.
+    \item \textbf{xv6 physical allocator}: \texttt{kalloc}/\texttt{kfree} manage a singly-linked free list embedded inside free pages; binary ownership model (no CoW support).
+    \item \textbf{walkpgdir / mappages / setupkvm}: the three xv6 functions that implement the software page walk, PTE installation, and kernel address space construction respectively.
+    \item \textbf{Paging applications}: lazy zero-page allocation, copy-on-write fork, memory-mapped files.
+\end{itemize}
+
+% ============================================================
+\section{References}
+% ============================================================
+
+\begin{itemize}
+    \item Russ Cox, Frans Kaashoek, and Robert Morris. \textit{xv6: A Simple, Unix-like Teaching Operating System}. MIT, 2011. \url{https://pdos.csail.mit.edu/6.828/2012/xv6.html}
+    \item Intel Corporation. \textit{Intel 64 and IA-32 Architectures Software Developer's Manual}, Volume 3A: System Programming Guide. Chapter~4 (Paging).
+    \item Liedtke, J. ``On Micro-Kernel Construction.'' \textit{ACM SOSP}. 1995.
+    \item Lagar-Cavilla, H.~A., et al. ``Snowflock: Rapid Virtual Machine Cloning for Cloud Computing.'' \textit{EuroSys}. 2009.
+    \item Venkataramani, G., et al. ``Kaleidoscope: Cloud Micro-Elasticity via VM State Coloring.'' \textit{EuroSys}. 2011.
+    \item Ren, K., et al. ``On-Demand-Fork: A Microsecond Fork for Memory-Intensive and Latency-Sensitive Applications.'' \textit{EuroSys}. 2021.
+\end{itemize}
+
+% ============================================================
+\section*{Personal Notes}
+% ============================================================
+% Add your own notes below this line
+
+\end{document}

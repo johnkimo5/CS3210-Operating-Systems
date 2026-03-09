@@ -20,7 +20,12 @@ When generating LaTeX lecture notes for this repository, follow the template est
 \usepackage{booktabs}
 ```
 
-Do NOT add packages beyond this set unless the content strictly requires it (e.g. `tikz` for a diagram). Do not use `mdframed`, `fancyhdr`, or coloured callout boxes.
+Do NOT add packages beyond this set unless the content strictly requires it. Additional permitted packages:
+
+- `tcolorbox` — for coloured callout boxes (see **Callout Boxes** below).
+- `tikz` — for diagrams and visuals (see **Visuals and Diagrams** below).
+
+Do not use `mdframed` or `fancyhdr`.
 
 ---
 
@@ -127,6 +132,65 @@ row & row \\
 \text{shell (user)} \xrightarrow{\text{save ctx}} \text{shell (kernel)} \xrightarrow{\text{swtch}} \text{scheduler}
 \]
 ```
+
+---
+
+## Callout Boxes
+
+Use `tcolorbox` to highlight **key ideas**, **key tips**, and **key intuitions** — things worth remembering at a glance. Do not overuse them; one to three per major section is a good ceiling.
+
+Define these three box styles in the preamble:
+
+```latex
+\usepackage{tcolorbox}
+
+\newtcolorbox{keyidea}[1][]{colback=blue!5, colframe=blue!50!black,
+    fonttitle=\bfseries, title=Key Idea, #1}
+
+\newtcolorbox{keytip}[1][]{colback=green!5, colframe=green!50!black,
+    fonttitle=\bfseries, title=Tip, #1}
+
+\newtcolorbox{keyintuition}[1][]{colback=orange!5, colframe=orange!50!black,
+    fonttitle=\bfseries, title=Intuition, #1}
+```
+
+Usage in the document body:
+
+```latex
+\begin{keyidea}
+Context switching is expensive because the CPU must save and restore
+the full register set, TLB entries may be flushed, and caches go cold.
+\end{keyidea}
+```
+
+Keep the text inside each box to one short paragraph (2–4 sentences). These boxes should distill an insight, not replace the surrounding prose.
+
+---
+
+## Visuals and Diagrams
+
+Lecture notes should include **TikZ diagrams** wherever a visual mental model would help the reader understand a concept more accurately than prose alone. Aim for at least one or two diagrams per lecture. Good candidates include:
+
+- **Architecture diagrams** — memory layouts, address-space structure, page-table walks.
+- **Flow diagrams** — system-call paths, interrupt handling sequences, scheduler transitions.
+- **State machines** — process states and transitions, lock states.
+- **Stack/memory illustrations** — showing how frames are laid out, where registers are saved, etc.
+- **Comparison diagrams** — side-by-side visuals of two approaches (e.g. monolithic vs. microkernel).
+
+Use `tikz` with the `arrows.meta`, `positioning`, and `shapes.geometric` libraries as needed:
+
+```latex
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric}
+```
+
+General guidelines:
+
+- Every diagram must have a brief caption or label (use `\begin{figure}[h] ... \caption{} ... \end{figure}`).
+- Use clear, consistent colours: blue for user-space, red/orange for kernel-space, gray for hardware is a good default palette, but adapt as needed.
+- Keep diagrams simple and readable — they should clarify, not overwhelm.
+- When a process or transition has multiple steps, number them in the diagram.
+- Prefer diagrams over long verbal descriptions of spatial relationships or multi-step flows.
 
 ---
 

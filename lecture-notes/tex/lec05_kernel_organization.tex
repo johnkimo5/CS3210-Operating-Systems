@@ -1,0 +1,287 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{booktabs}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{gray}\itshape,
+    stringstyle=\color{red},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4
+}
+
+\title{\textbf{CS3210: Operating Systems} \\ Lecture 5 --- Kernel Organization and APIs}
+\author{John Kim \\ Georgia Institute of Technology}
+\date{January 29, 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Introduction: How Do We Build an Operating System?}
+% ============================================================
+
+The previous lecture established \emph{why} isolation is needed and what hardware mechanisms enforce it. This lecture addresses the complementary question: \emph{where} inside an operating system does the enforcement logic actually live? Specifically, which subsystems belong inside the \textbf{kernel}---the privileged core that runs at ring 0---and which can safely reside in user space?
+
+This is not a purely academic question. The choice of kernel structure determines how failures propagate, how fast system calls execute, and how complex the codebase becomes. The lecture surveys the three canonical answers---monolithic kernels, microkernels, and exokernels---compares them on the safety/performance Pareto frontier, and then dives into the concrete mechanics of the xv6 kernel API and its threading model.
+
+% ============================================================
+\section{Kernel Organization: Drawing the Line}
+% ============================================================
+
+An operating system provides many services: file systems, memory management, process scheduling, device drivers, networking, and inter-process communication. The central design question is whether all of these services must run at kernel privilege level, or whether only a \emph{minimal} subset truly needs to.
+
+\subsection{The Minimal Kernel Requirement}
+
+At minimum, the kernel must provide two things:
+
+\begin{enumerate}
+    \item \textbf{Isolation}: each process must be confined to its own address space and given only its allotted share of CPU time. Without kernel-enforced isolation, any process could corrupt or starve any other.
+    \item \textbf{Protection}: the kernel must validate all requests that cross the privilege boundary. User code cannot be trusted to sanitize its own arguments.
+\end{enumerate}
+
+Everything beyond isolation and protection---filesystem logic, network stacks, caching policies---is, in principle, optional inside the kernel. The debate is about whether moving those services out buys enough in safety and modularity to justify the performance cost.
+
+\subsection{Declarative vs.\ Imperative Service Mapping}
+
+In a monolithic design every user process has access to all kernel services through the same system call table: every user $U_i$ can invoke any service $s_j$. In a microkernel design each user process is associated only with the subset of services it legitimately needs, and those services themselves run as user-space processes. Service mapping can be expressed in two styles: \textbf{declarative} (the system is given a policy description of which process may use which service) or \textbf{imperative} (the kernel is programmed with explicit rules that gate each access at runtime).
+
+% ============================================================
+\section{Monolithic Kernel Architecture}
+% ============================================================
+
+A \textbf{monolithic kernel} collapses all OS subsystems---\texttt{fs}, \texttt{sched}, \texttt{proc}, \texttt{mem}---into a single large kernel image running entirely at ring 0. Above the kernel sits a \emph{system layer} containing the C standard library, graphical server (X Server), middleware, and init daemons (e.g., \texttt{systemd}). Applications run above the system layer.
+
+A critical implication for xv6 developers: because the C standard library lives \emph{above} the kernel, not inside it, you \textbf{cannot} call C standard library functions (\texttt{printf}, \texttt{malloc}, \texttt{memcpy}, etc.) from within xv6 kernel code. Kernel code must use its own primitives.
+
+\subsection{The Monolithic Kernel API in Practice}
+
+Consider the familiar shell pipeline \texttt{echo Hello | cat}. Even this simple command exercises a rich set of kernel services. The shell (\texttt{sh}) calls \texttt{exec}, \texttt{open}, \texttt{close}, and \texttt{pipe}. The \texttt{cat} process calls \texttt{read} and \texttt{write}. The \texttt{echo} process calls \texttt{write}. Every one of these calls crosses the kernel--user divide and is serviced by the monolithic kernel's file-system subsystem. In xv6, that entire subsystem---file descriptors, inodes, block cache, pipe implementation---runs in the single kernel address space.
+
+The monolithic design's great advantage is speed: a system call in xv6 or Linux is a single \texttt{int} or \texttt{syscall} instruction, a trap to ring 0, a table lookup, and a return. There are no additional address-space switches or message-passing round trips.
+
+Its great liability is fault propagation: a bug in the filesystem driver, network stack, or any other subsystem corrupts the \emph{entire} kernel address space. A null-pointer dereference in \texttt{sys\_read} can panic the whole machine.
+
+% ============================================================
+\section{Microkernel Architecture}
+% ============================================================
+
+A \textbf{microkernel} pushes all non-essential services out of the kernel and into user-space \emph{server processes}. The kernel retains only the isolation and protection mechanisms: virtual memory management, basic IPC primitives, and process scheduling. Filesystem servers, memory managers, network stacks, and device drivers all run as ordinary (though privileged) user-level processes.
+
+The practical consequence is that a system call to the filesystem no longer goes directly to kernel code. Instead, the user process sends a \textbf{message} across the kernel--user divide to a filesystem server process, which handles the request and sends a reply. Real-world microkernel examples include Plan~9 from Bell Labs and Google's Fuchsia OS.
+
+\subsection{Microkernel Advantages}
+
+The primary advantage is \textbf{increased isolation}. If the filesystem server crashes, it crashes as an ordinary user-space process; the kernel and all other service processes continue running unaffected. This is the compartmentalized design ideal: subsystem failures are contained, and faulty servers can, in principle, be restarted without rebooting the machine.
+
+\subsection{Microkernel Disadvantages}
+
+The primary disadvantage is \textbf{performance}. What was a single trap in a monolithic kernel now requires at minimum two privilege-level crossings (user $\to$ kernel $\to$ user-space server $\to$ kernel $\to$ user), plus context switches and message copies. For I/O-intensive workloads, this overhead accumulates rapidly.
+
+A subtler disadvantage is that \emph{compartmentalization is hard to get right}. The filesystem server may rely on in-kernel caching or paging support that itself has dependencies; if the server crashes, those tangled dependencies may still cause system-wide disruption despite the architectural goal of isolation. The question ``if the FS crashes, does everything still work fine?'' is genuinely difficult to answer in practice.
+
+\subsection{The Safety--Performance Tradeoff}
+
+These two designs occupy different positions on the safety--performance Pareto frontier. Plotting safety on the vertical axis and performance on the horizontal axis, the frontier is a concave curve: you cannot simultaneously maximize both. The monolithic kernel sits lower on safety but higher on performance; the microkernel sits higher on safety but lower on performance. Both are \emph{on} the frontier---they represent rational engineering choices. ``Bad design'' falls below the frontier: it sacrifices both safety \emph{and} performance.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Design} & \textbf{Safety} & \textbf{Performance} \\
+\midrule
+Monolithic (e.g., xv6, Linux) & Lower (shared fault domain) & Higher (direct trap) \\
+Microkernel (e.g., Plan~9, Fuchsia) & Higher (fault containment) & Lower (message passing) \\
+Bad design & Low & Low \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Microkernel Case Study: Factored Operating System (FOS)}
+% ============================================================
+
+\textbf{Factored Operating System (FOS)}, developed at Georgia Tech by Wentzlaff et al., is a research microkernel designed for massively parallel many-core processors. The key insight is that on a chip with dozens or hundreds of cores, the OS itself should be \emph{parallelized}: rather than a single filesystem instance protected by locks, FOS runs a \textbf{fleet of filesystem servers} (labeled \texttt{FS}) and a \textbf{fleet of physical memory allocation servers} (labeled \texttt{M}), distributed across cores. Idle cores are tracked explicitly.
+
+From the application's point of view, a function call to the standard file API becomes a \textbf{function call to a message proxy library}, which packages the request as a message and hands it to the fos-microkernel for routing. The message walkthrough for a file access proceeds as follows:
+
+\begin{enumerate}
+    \item The application makes a function call to the message proxy library.
+    \item The proxy library constructs a message.
+    \item The fos-microkernel on the application's core receives the message.
+    \item The microkernel consults its local \emph{name cache} to locate the appropriate filesystem server.
+    \item The message is forwarded across the interconnect to the target core running the FS server.
+    \item The FS server's fos-microkernel receives the message.
+    \item The message is delivered to the FS server process.
+    \item The FS server processes the filesystem request.
+    \item The response is returned along the reverse path back to the application.
+\end{enumerate}
+
+This design achieves high throughput on multicore hardware precisely because the OS services scale with the number of cores, eliminating the centralized-lock bottlenecks of a monolithic kernel.
+
+% ============================================================
+\section{The xv6 Kernel API}
+% ============================================================
+
+xv6 is a \textbf{monolithic kernel} that implements a Unix-like system call interface. Understanding its API is both practically important for the labs and conceptually important for understanding how real kernels (Linux in particular) work.
+
+\subsection{System Call Table and File Descriptors}
+
+The xv6 system call table (Figure 0-2 of the xv6 book) groups calls into two families. \emph{Process-management} calls include \texttt{fork}, \texttt{exit}, \texttt{wait}, \texttt{kill}, \texttt{getpid}, \texttt{sleep}, and \texttt{exec}. \emph{File-system and I/O} calls include \texttt{open}, \texttt{read}, \texttt{write}, \texttt{close}, \texttt{dup}, \texttt{pipe}, \texttt{chdir}, \texttt{mkdir}, \texttt{mknod}, \texttt{fstat}, \texttt{link}, \texttt{unlink}, and \texttt{sbrk}.
+
+The abstraction unifying almost all I/O in xv6 is the \textbf{file descriptor}. A file descriptor is a small non-negative integer that serves as an opaque handle to any I/O resource: a disk file, a pipe endpoint, or the console. The kernel maintains a per-process table of open file descriptors. By routing all I/O through this single abstraction, xv6 allows programs to be composed in pipelines without caring whether their input comes from a file or from another process.
+
+\subsection{System Call Path in xv6}
+
+When a user-space program (such as \texttt{sh}) needs to invoke a system call, the sequence of code paths involved spans several files. The user-side stub is generated from \texttt{usys.S}, which uses the \texttt{SYSCALL} macro to place the syscall number in \texttt{\%eax} and issue \texttt{int \$T\_SYSCALL} (interrupt \texttt{0x40}):
+
+\begin{lstlisting}[language={[x86masm]Assembler}, caption={User-side syscall stub generated by usys.S (simplified)}]
+#define SYSCALL(name) \
+  .globl name;        \
+  name:               \
+    movl $SYS_ ## name, %eax; \
+    int $T_SYSCALL;   \
+    ret
+\end{lstlisting}
+
+Inside the kernel, the interrupt causes a trap. The \texttt{vector.S} file contains the trap vector table that dispatches interrupt \texttt{0x40} to the trap handler. The trap handler, implemented in \texttt{entryother.S} and \texttt{trap.c}, inspects the trap number and, for system call traps, reads the system call number from \texttt{\%eax}. It then indexes into the \textbf{system call table} defined in \texttt{syscall.h} and \texttt{syscall.c}, dispatching to the appropriate handler (e.g., \texttt{sys\_read}). The handlers themselves live primarily in \texttt{sysfile.c} (file-related calls) and \texttt{sysproc.c} (process-related calls).
+
+The full path can be summarized as:
+
+\[
+\text{User code (usys.S)} \xrightarrow{\texttt{int 0x40}} \text{Trap Vector (vector.S)} \xrightarrow{} \text{Trap Handler (trap.c)} \xrightarrow{} \text{Syscall Table} \xrightarrow{} \text{sys\_read, etc.}
+\]
+
+\subsection{Historical Context: The Unix System Call Interface}
+
+When Unix was originally designed in the early 1970s, the system call interface was motivated by a very specific use case: allowing users on a shared mainframe to compose programs together using shell pipelines in a terminal. The elegance of \texttt{echo Hello | cat}---two independent processes communicating through a pipe, each using the same \texttt{read}/\texttt{write} abstraction---was genuinely novel for the time.
+
+Over the following decades, the interface was extended to cover graphical interactions, network sockets, and many other use cases. The result is that Linux now has approximately \textbf{300 system calls}, compared to xv6's \textbf{21}. The accretion of functionality over time also produced redundancies: \texttt{dup}/\texttt{dup2}/\texttt{dup3}, \texttt{pipe}/\texttt{pipe2}, and three generations of I/O multiplexing (\texttt{select}, \texttt{poll}, \texttt{epoll}) all exist in Linux because the API is standardized and therefore nearly impossible to remove calls from---only additions are safe. xv6 system calls are invoked directly by user code; Linux system calls are wrapped by the standard C library (\texttt{glibc}), which provides the POSIX-compliant interface that application code actually calls.
+
+\subsection{Adding a System Call}
+
+Adding a new system call to xv6 (or Linux) follows a consistent four-step recipe:
+
+\begin{enumerate}
+    \item Write the C implementation of the handler function (e.g., \texttt{sys\_myname} in \texttt{sysfile.c} or \texttt{sysproc.c}).
+    \item Add the function prototype and number to the kernel's syscall header (e.g., \texttt{syscall.h}).
+    \item Assign a system call number in the syscall number file (e.g., \texttt{syscall.h} for xv6, \texttt{unistd.h} for Linux).
+    \item Register the handler in the system call dispatch table so that the syscall number maps to the handler.
+\end{enumerate}
+
+The Linux process is almost identical, with the additional requirement of ensuring backward compatibility: the Linux API is standardized by POSIX and cannot remove or change the semantics of existing calls.
+
+% ============================================================
+\section{Kernel Concurrency and Threading Models}
+% ============================================================
+
+A monolithic kernel faces an immediate concurrency challenge: multiple user-space processes may invoke system calls simultaneously. On a multicore machine, two instances of \texttt{sh} could literally be executing \texttt{int 0x40} at the same clock cycle. How should the kernel handle this?
+
+\subsection{The Three Models}
+
+Kernel designers have historically adopted three strategies for mapping user processes to kernel execution contexts.
+
+\subsubsection*{Many-to-One (N:1)}
+
+In the \textbf{many-to-one} model, all user processes share a \emph{single} kernel stack and execution context. When any process enters a system call, it must acquire a lock on that single context before proceeding. The advantages are simplicity: with only one kernel thread there are no data races inside the kernel, so concurrency control reduces to a global lock. The disadvantages are severe: only one process can be in a system call at any given time, which makes this model entirely impractical for multicore systems or any workload with significant I/O concurrency.
+
+\subsubsection*{One-to-One (1:1)}
+
+In the \textbf{one-to-one} model, each user process has its own dedicated kernel stack and kernel execution context. When process $A$ traps into the kernel, it uses $A$'s kernel stack; when process $B$ traps simultaneously on another core, it uses $B$'s kernel stack. The stacks are \emph{not} shared, so processes do not have to wait on each other to enter system calls. This is the model used by \textbf{xv6}, Linux, Windows (since Windows~95), and Solaris. Concurrent kernel accesses are controlled by fine-grained locks on individual kernel data structures rather than a global context lock.
+
+\subsubsection*{Many-to-Many (M:N)}
+
+In the \textbf{many-to-many} model, $P$ user processes are multiplexed over $C$ kernel contexts, where typically $P \geq C$. This is a middle ground: it avoids the memory overhead of allocating one kernel stack per user process (beneficial when $P$ is very large) while still allowing multiple processes to be in the kernel simultaneously. The complexity cost is that concurrent locking is still required inside the kernel---you save memory relative to 1:1 but do not simplify the concurrency problem. Old versions of IRIX, HP-UX, and Solaris offered a hybrid mode in which the kernel could choose between M:N and 1:1 depending on workload.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Model} & \textbf{Advantage} & \textbf{Disadvantage} \\
+\midrule
+Many-to-One (N:1) & Simple concurrency (single tenant) & Underutilizes resources; no parallelism \\
+One-to-One (1:1)  & Parallel syscalls; no shared stack & One kernel stack per process (memory) \\
+Many-to-Many (M:N) & Saves memory vs.\ 1:1 & Still needs concurrent kernel locking \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Modern Microkernels: Google Fuchsia and Zircon}
+% ============================================================
+
+A compelling real-world microkernel is \textbf{Fuchsia}, Google's open-source operating system (named for the color Pink + Purple). Unlike Android or Chrome OS, Fuchsia is \emph{not} a descendant of Linux or Unix; it is a ground-up redesign targeted at IoT devices and ubiquitous computing. Fuchsia is built on the \textbf{Zircon} microkernel, and its architecture incorporates several ideas that directly address the classical weaknesses of microkernels.
+
+\subsection{Capability-Based Security Model}
+
+The most significant design departure from Linux is that Zircon system calls are \textbf{access-controlled by capabilities}. In Linux, any process can invoke any system call that its privilege level permits---the call number alone determines what operation is performed. In Zircon, a thread must explicitly \emph{hold} the capability object for a system call before it can invoke that call. Capabilities are unforgeable kernel objects that can be granted, transferred, and revoked. This approach enforces the \emph{principle of least privilege} at the system-call level: a thread that handles only network I/O never holds filesystem capabilities and therefore cannot corrupt the filesystem even if it is compromised.
+
+\subsection{Jobs and Resource Limits}
+
+Fuchsia introduces the abstraction of \textbf{jobs} to group related processes and define resource limits collectively. A job owns its child processes and can set hard bounds on memory, CPU time, and other resources. This makes resource accounting and isolation composable: a container-like boundary can be enforced without requiring a full virtual machine.
+
+Fuchsia also provides sufficient primitives to implement C and C++ standard library functionality, which is essential for running existing application code. Strategically, Fuchsia also frees Google from the GPL license that governs the Linux kernel (and therefore Android) and from the Oracle lawsuit over Java APIs in Android---both significant business motivations alongside the technical ones.
+
+% ============================================================
+\section{Exokernels: Protection Without Abstraction}
+% ============================================================
+
+The \textbf{exokernel} design, proposed by Dawson Engler in his 1998 MIT Ph.D.\ thesis, takes the minimization argument further than a microkernel. While a microkernel still provides abstractions (IPC, virtual memory mapping, process objects), an exokernel argues that the kernel need only provide \textbf{protection}---that is, the kernel should multiplex raw hardware resources and enforce access control, but provide \emph{no abstractions whatsoever}. Abstractions like virtual memory, file systems, and even isolation are provided by \emph{untrusted library operating systems} (\texttt{libOS}) running at user level, each of which can access hardware resources directly subject to the kernel's protection checks.
+
+\subsection{Architecture}
+
+In a notional exokernel system, each application is paired with its own \texttt{libOS} that implements whatever OS abstractions the application needs. A compiler such as \texttt{gcc} runs with a \texttt{libOS} containing virtual memory (\texttt{VM}), networking (\texttt{NET}), and filesystem (\texttt{FS}) support. A specialized web server might run with a stripped-down \texttt{libOS} subset containing only \texttt{FS} and \texttt{NET}. Both applications sit above the exokernel, which only knows about low-level resources: \emph{memory pages}, \emph{disk blocks}, and \emph{network packets}.
+
+The exokernel's role is to track which application owns which physical page or disk block, to enforce that applications only access resources they have been granted, and to multiplex access when resources are shared. It does not implement files, processes, or virtual address spaces---those are \texttt{libOS} concerns.
+
+\subsection{Tradeoffs}
+
+The exokernel achieves remarkable performance: by pushing abstraction into user-space libraries, applications can customize their own OS policies (cache replacement, scheduling hints, filesystem layout) to match their workload. A database can manage its own buffer cache without fighting the kernel's generic page cache. However, security properties are harder to reason about because isolation itself is a \texttt{libOS} concern rather than a kernel guarantee. Exokernels remain primarily a research artifact; for further discussion, see CS4210/6210.
+
+% ============================================================
+\section{Summary}
+% ============================================================
+
+\begin{itemize}
+    \item \textbf{Kernel responsibilities}: The minimum kernel responsibility is isolation and protection; everything else---filesystems, networking, drivers---is architecturally optional inside the kernel.
+    \item \textbf{Monolithic kernel}: All OS subsystems run in a single kernel address space. Fast (one trap for a syscall), but a bug in any subsystem can crash the whole kernel. xv6 and Linux are monolithic.
+    \item \textbf{Microkernel}: Only isolation/IPC primitives live in the kernel; all services run as user-space servers communicating by message passing. Safer (fault containment) but slower (extra context switches per service call). Plan~9 and Fuchsia are examples.
+    \item \textbf{Safety--performance tradeoff}: Monolithic and microkernel designs occupy different positions on the Pareto frontier; neither dominates. ``Bad design'' sacrifices both.
+    \item \textbf{xv6 system call path}: User stubs (\texttt{usys.S}) issue \texttt{int 0x40}; the trap vector (\texttt{vector.S}) dispatches to the trap handler (\texttt{trap.c}); the handler indexes the syscall table (\texttt{syscall.c}) to reach the implementation (\texttt{sysfile.c}, \texttt{sysproc.c}).
+    \item \textbf{File descriptors}: The universal xv6 I/O abstraction---integer handles covering files, pipes, and the console.
+    \item \textbf{Linux vs.\ xv6 syscall interface}: Linux has $\sim$300 syscalls (vs.\ xv6's 21); Linux wraps syscalls in \texttt{glibc} while xv6 calls them directly; the Linux API is frozen by standardization.
+    \item \textbf{Kernel threading models}: Many-to-One (simple but serialized), One-to-One (parallel, used by xv6/Linux), Many-to-Many (saves memory but retains locking complexity), and Hybrid.
+    \item \textbf{Fuchsia/Zircon}: Modern capability-based microkernel; syscalls are access-controlled by unforgeable capability objects; processes grouped into resource-limited jobs.
+    \item \textbf{Exokernel}: Extreme minimization---kernel only multiplexes and protects raw hardware; all abstractions (including isolation) delegated to per-application \texttt{libOS} libraries.
+    \item \textbf{FOS}: Georgia Tech's research microkernel that scales OS services (filesystem servers, memory allocation servers) across many-core chips using message passing.
+\end{itemize}
+
+% ============================================================
+\section{References}
+% ============================================================
+
+\begin{itemize}
+    \item Russ Cox, Frans Kaashoek, and Robert Morris. \textit{xv6: A Simple, Unix-like Teaching Operating System}. MIT, 2011. \url{https://pdos.csail.mit.edu/6.828/2012/xv6.html}
+    \item Wentzlaff, D., et al. ``Factored Operating Systems (fos): The Case for a Scalable OS for Multicores.'' \textit{ACM SIGOPS Operating Systems Review}. 2009.
+    \item Engler, D.~R. ``The Exokernel Operating System Architecture.'' Ph.D.\ Thesis, MIT. October 1998.
+    \item Google Fuchsia OS overview: \url{https://www.digitaltrends.com/mobile/google-fuchsia-os-news/}
+    \item Andrew S.\ Tanenbaum and Herbert Bos. \textit{Modern Operating Systems}, 4th ed.\ Pearson, 2015.
+\end{itemize}
+
+% ============================================================
+\section*{Personal Notes}
+% ============================================================
+% Add your own notes below this line
+
+\end{document}
